@@ -14,6 +14,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "quirc-master/lib/quirc.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #define BUFSIZE 1024
 #define QSIZE 5
 
@@ -81,14 +86,24 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   }
    
   // get file content
-  char buffer[fsize]; buffer[fsize] = '\0';
+  //char buffer[fsize];
+  //buffer[fsize] = '\0';
+  
+  uint8_t *buffer = malloc(fsize);
+
+  if(buffer == NULL){
+    perror("Failed to allocate image buffer");
+    return;
+  }
+  
   int  bytesActuallyReceived;
   uint32_t bytesReceivedsoFar = 0;
   while (bytesReceivedsoFar < fsize) {
-    bytesActuallyReceived = recv(connfd, buffer+bytesReceivedsoFar, fsize-bytesReceivedsoFar, 0);
+    bytesActuallyReceived = recv(connfd, buffer + bytesReceivedsoFar, fsize - bytesReceivedsoFar, 0);
       // 1. Check for system/network errors
       if (bytesActuallyReceived < 0) {
           printf("Network error during recv");
+          free(buffer);
           break;
       }
       
@@ -96,19 +111,74 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
       if (bytesActuallyReceived == 0) {
           fprintf(stderr, "Error: Client closed connection prematurely at %u / %u bytes.\n", 
                   bytesReceivedsoFar, fsize);
+          free(buffer);
           break;
       } 
     bytesReceivedsoFar += bytesActuallyReceived;
   }
 
-if (bytesReceivedsoFar == fsize) {
-    printf("SUCCESS: File completely received! Total bytes: %u / %u\n", bytesReceivedsoFar, fsize);
-    printf("%s\n", buffer);
-} else {
+  if (bytesReceivedsoFar == fsize) {
+      printf("SUCCESS: File completely received! Total bytes: %u / %u\n", bytesReceivedsoFar, fsize);
+      printf("%s\n", buffer);
+  } else {
     printf("FAILURE: File transfer incomplete. Skipping file dump.\n");
-} 
+  } 
 
-// TODO: call qr decoder here when ready
+  // TODO: call qr decoder here when ready
+  
+  //decoding an image into greyscale pixel array
+  int w, h, channels;
+  uint8_t *pixels = stbi_load_from_memory(buffer, fsize, &w, &h, &channels, 1);
+  free(buffer);
+
+  if(!pixels){
+    fprintf(stderr, "Failed to decode image", stbi_failure_reason());
+  }
+
+  printf("Image: %d x %d\n", w, h);
+  
+  struct quirc *qr = quirc_new();\
+
+  if(!qr){
+    perror("Failed to allocate memory");
+    stbi_image_free(pixels);
+    return;
+  }
+
+  if(quirc_resize(qr, w, h)){
+    perror("Failed to allocate video memory");
+    quirc_destroy(qr);
+    stbi_image_free(pixels);
+    return;
+  }
+
+  int qw, qh;//get these from the passed image
+  uint8_t *qimage = quirc_begin(qr, &qw, &qh);
+  
+  memcpy(qimage, pixels, (size_t)w*h);
+  stbi_image_free(pixels);
+  quirc_end(qr);
+
+  int num_codes = quirc_count(qr);
+  printf("Found %d QR codes\n", num_codes);
+
+  for(int i = 0; i < num_codes; i++){
+    struct quirc_code code;
+    struct quirc_data data;
+    quirc_decode_error_t err;
+
+    quirc_extract(qr, i, &code);
+
+    /* Decoding stage */
+    err = quirc_decode(&code, &data);
+    if (err)
+        printf("DECODE FAILED: %s\n", quirc_strerror(err));
+    else
+        printf("Data: %s\n", data.payload);
+  }
+
+  quirc_destroy(qr);
+
 }
 
 int main(int argc, char **argv) {

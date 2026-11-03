@@ -1,10 +1,11 @@
 # Compiler and flags
-CC = gcc
-CFLAGS = -Wall -Wextra -O2
+CC      = gcc
+CFLAGS  = -Wall -Wextra -O2 -I quirc-master/lib
+LDLIBS  = -lm
 
 # Directories
-SRC_DIR = src
-OBJ_DIR = obj
+QUIRC_SRC = $(wildcard quirc-master/lib/*.c)
+QUIRC_OBJ = $(QUIRC_SRC:.c=.o)
 
 # Target executables
 TARGETS = echoserver echoclient
@@ -13,24 +14,24 @@ TARGETS = echoserver echoclient
 all: $(TARGETS)
 
 # Rule to build the server executable
-echoserver: $(OBJ_DIR)/echoserver.o
-	$(CC) $(CFLAGS) -o $@ $<
+echoserver: echoserver.o $(QUIRC_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Rule to build the client executable
-echoclient: $(OBJ_DIR)/echoclient.o
-	$(CC) $(CFLAGS) -o $@ $<
+echoclient: echoclient.o
+	$(CC) $(CFLAGS) -o $@ $^
 
 
 # Generic rule to compile .c files from src/ into .o files in obj/
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+%.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Order-only prerequisite to ensure obj/ directory exists
-$(OBJ_DIR):
-	mkdir -p $(OBJ_DIR)
+# $(OBJ_DIR):
+# 	mkdir -p $(OBJ_DIR)
 
 # Clean up build files
 clean:
-	rm -rf $(OBJ_DIR) $(TARGETS)
+	rm -f *.o quirc-master/lib/*.o $(TARGETS)
 
 #	.PHONY: all clean
