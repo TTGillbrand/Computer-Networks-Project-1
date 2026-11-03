@@ -4,22 +4,22 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h> 
-#include <sys/stat.h> // TODO - for get_file_size
-#include <unistd.h> // todo - for get_file_Size
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define BUFSIZE 1024
 
 /* 
  * error - wrapper for perror
  */
-
-     char *hostname;;
+char *hostname;;
 int portno;
 
 void error(char *msg) {
@@ -36,15 +36,7 @@ void process_args(int argc, char **argv) {
     portno = atoi(argv[2]);
 }
 
-u_int32_t get_file_size(const char *filename) {
-    //debug
-    /*
-    char cwd[1024];
-if (getcwd(cwd, sizeof(cwd)) != NULL) {
-    printf("DEBUG - Your program is looking for files in: %s\n", cwd);
-}
-    */
-
+int32_t get_file_size(const char *filename) {
     FILE *fp = fopen(filename, "rb"); 
     if (fp == NULL) {
         return -1; 
@@ -57,10 +49,10 @@ if (getcwd(cwd, sizeof(cwd)) != NULL) {
     }
 
     // Get the current position (which matches total bytes)
-    u_int32_t size = ftell(fp); 
+    long size = ftell(fp); 
 
     fclose(fp);
-    return size;
+    return (int32_t) size;
 }
 
 int send_file(int sockfd, const char *filename) {
@@ -71,33 +63,27 @@ int send_file(int sockfd, const char *filename) {
     }
 
     char buffer[BUFSIZE];
-    bzero(buffer, BUFSIZE); // todo: Should this be inside the outter loop.
+    bzero(buffer, BUFSIZE);
     size_t bytes_read = 0;
     // Read the file chunk by chunk until the end (EOF)
     // outter loop: ensure buffer size is bounded (does not depend on file size)
-    while ((bytes_read = fread(buffer, sizeof(char), BUFSIZE, file)) > 0) {
+    while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
         size_t total_sent = 0;
-        buffer[bytes_read] = '\0'; 
-
-        //TODO: Need to add nwk data conversion everyone for send/recv -  htons, ntohs 
-
-        printf("DEBUG file read:\n%s\n", buffer); //TODO: Check what the weird characters at the end are.
-
-        // inner loop: handle partial sends
-        // send does not garantee all bytes_read data will be sent at once, so need to loop til all bytes are processed.
-        // pseudo-code from part1 video
         while (total_sent < bytes_read) {
             ssize_t sent = send(sockfd, buffer + total_sent, bytes_read - total_sent, 0);
-            
             if (sent < 0) {
                 printf("Error sending data");
                 fclose(file);
                 return -1;
             }
-
+            for (int i = total_sent; i < total_sent + sent; i++) {    
+                putchar(buffer[i]); // Or: printf("%c", buffer[i]);        
+            }
+            
             //printf("DEBUG SEND: %ld bytes\n", sent); //TODO: print part of buffer that was sent in this iteration.
             total_sent += sent; // Advance the pointer by the amount actually sent
         }
+
         bzero(buffer, BUFSIZE); 
     }
 
@@ -107,12 +93,12 @@ int send_file(int sockfd, const char *filename) {
 
 int main(int argc, char **argv) {
     int sockfd,  n;
-    struct sockaddr_in serveraddr; // TODO: fix build issue. old: sockaddr_in
+    struct sockaddr_in serveraddr;
     struct hostent *server;
 
     char buf[BUFSIZE];
 
-    u_int32_t fsize;
+    uint32_t fsize;
 
     /* check command line arguments */
     process_args(argc, argv);
@@ -154,13 +140,15 @@ int main(int argc, char **argv) {
     // compute and send file size.
     fsize = get_file_size(buf); 
 
-    printf("DEBUG file size is %d\n", fsize);
+    //printf("DEBUG file size is %d\n", fsize);
 
     /* send: send the file size to the server*/
-    n = send(sockfd, &fsize, sizeof(fsize), 0); 
+    uint32_t net_fsize = htonl(fsize);
+
+    n = send(sockfd, &net_fsize, sizeof(net_fsize), 0);
+
     if (n < 0) 
       error("ERROR sending to socket");
-
 
     // now read file content into buf and send it to server.
     n = send_file(sockfd, buf); // TODO: same with fopen call here too. as line 153 buf); 
