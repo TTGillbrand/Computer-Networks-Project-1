@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -15,25 +16,65 @@
 #include <unistd.h>
 
 #define BUFSIZE 1024
+#define MAX_PAYLOAD_SIZE 8896
+#define MAX_TEXT_RESPONSE_SIZE (20U * 1024U * 1024U)
 
-/* 
- * error - wrapper for perror
- */
+#define FILE_TYPE_NEITHER = 0,
+#define FILE_TYPE_IMAGE = 1,
+#define FILE_TYPE_TEXT = 2
+
+#define RESPONSE_STATUS_URL = 0,
+#define RESPONSE_STATUS_ERROR = 1,
+#define RESPONSE_STATUS_TEXT = 2
+
+// error - wrapper for perror
 char *hostname;;
 int portno;
 
 void error(char *msg) {
     perror(msg);
-    exit(0);
+    exit(1);
 }
 
 void process_args(int argc, char **argv) {
     if (argc != 3) {
        fprintf(stderr,"usage: %s <hostname> <port>\n", argv[0]);
-       exit(0);
+       exit(1);
     }
     hostname = argv[1];
     portno = atoi(argv[2]);
+}
+
+static int send_all(int fd, const void *buffer, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (result == 0)
+            return -1;
+        sent += (size_t)result;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buffer, size_t length) {
+    size_t received = 0;
+    while (received < length) {
+        ssize_t result = recv(fd, (char *)buffer + received, length - received, 0);
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (result == 0)
+            return 0;
+        received += (size_t)result;
+    }
+    return 1;
 }
 
 int32_t get_file_size(const char *filename) {
@@ -55,36 +96,132 @@ int32_t get_file_size(const char *filename) {
     return (int32_t) size;
 }
 
+int32_t get_file_type(const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL)
+        return FILE_TYPE_NEITHER;
+
+    unsigned char header[12];
+    size_t header_size = fread(header, 1, sizeof(header), file);
+    int is_image =
+        (header_size >= 3 && header[0] == 0xFF &&
+         header[1] == 0xD8 && header[2] == 0xFF) ||
+        (header_size >= 8 &&
+         memcmp(header, "\x89PNG\r\n\x1A\n", 8) == 0) ||
+        (header_size >= 6 &&
+         (memcmp(header, "GIF87a", 6) == 0 ||
+          memcmp(header, "GIF89a", 6) == 0)) ||
+        (header_size >= 2 && memcmp(header, "BM", 2) == 0) ||
+        (header_size >= 4 &&
+         (memcmp(header, "II*\0", 4) == 0 ||
+          memcmp(header, "MM\0*", 4) == 0)) ||
+        (header_size >= 12 && memcmp(header, "RIFF", 4) == 0 &&
+         memcmp(header + 8, "WEBP", 4) == 0);
+
+    if (is_image) {
+        fclose(file);
+        return FILE_TYPE_IMAGE;
+    }
+
+    if (ferror(file) || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return FILE_TYPE_NEITHER;
+    }
+
+    int remaining_utf8 = 0;
+    unsigned char next_min = 0x80;
+    unsigned char next_max = 0xBF;
+    unsigned char buffer[BUFSIZE];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            unsigned char byte = buffer[i];
+            if (remaining_utf8 > 0) {
+                if (byte < next_min || byte > next_max)
+                    goto not_text;
+                remaining_utf8--;
+                next_min = 0x80;
+                next_max = 0xBF;
+            } else if (byte <= 0x7F) {
+                if (byte != '\t' && byte != '\n' && byte != '\v' &&
+                    byte != '\f' && byte != '\r' &&
+                    (byte < 0x20 || byte == 0x7F))
+                    goto not_text;
+            } else if (byte >= 0xC2 && byte <= 0xDF) {
+                remaining_utf8 = 1;
+            } else if (byte == 0xE0) {
+                remaining_utf8 = 2;
+                next_min = 0xA0;
+            } else if ((byte >= 0xE1 && byte <= 0xEC) ||
+                       (byte >= 0xEE && byte <= 0xEF)) {
+                remaining_utf8 = 2;
+            } else if (byte == 0xED) {
+                remaining_utf8 = 2;
+                next_max = 0x9F;
+            } else if (byte == 0xF0) {
+                remaining_utf8 = 3;
+                next_min = 0x90;
+            } else if (byte >= 0xF1 && byte <= 0xF3) {
+                remaining_utf8 = 3;
+            } else if (byte == 0xF4) {
+                remaining_utf8 = 3;
+                next_max = 0x8F;
+            } else {
+                goto not_text;
+            }
+        }
+    }
+
+    if (ferror(file) || remaining_utf8 != 0)
+        goto not_text;
+
+    fclose(file);
+    return FILE_TYPE_TEXT;
+
+not_text:
+    fclose(file);
+    return FILE_TYPE_NEITHER;
+}
+
+
 int send_file(int sockfd, const char *filename) {
     FILE *file = fopen(filename, "rb");
     if (file == NULL) {
-        fprintf(stderr, "Error opening file %s.\n", filename);
+        fprintf(stderr, "Status: 1\nError opening file %s.\n", filename);
         return -1;
     }
 
     char buffer[BUFSIZE];
     bzero(buffer, BUFSIZE);
     size_t bytes_read = 0;
-    // Read the file chunk by chunk until the end (EOF)
+    // Read the file chunk by chunk until the end of file
     // outter loop: ensure buffer size is bounded (does not depend on file size)
     while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
         size_t total_sent = 0;
         while (total_sent < bytes_read) {
             ssize_t sent = send(sockfd, buffer + total_sent, bytes_read - total_sent, 0);
             if (sent < 0) {
-                printf("Error sending data");
+                if (errno == EINTR)
+                    continue;
+                printf("Status: 1\nError sending data");
                 fclose(file);
                 return -1;
             }
-            for (int i = total_sent; i < total_sent + sent; i++) {    
-                putchar(buffer[i]); // Or: printf("%c", buffer[i]);        
+            if (sent == 0) {
+                fprintf(stderr, "Status: 1\nERROR: connection closed while sending file\n");
+                fclose(file);
+                return -1;
             }
-            
-            //printf("DEBUG SEND: %ld bytes\n", sent); //TODO: print part of buffer that was sent in this iteration.
             total_sent += sent; // Advance the pointer by the amount actually sent
         }
 
         bzero(buffer, BUFSIZE); 
+    }
+
+    if (ferror(file)) {
+        perror("Status: 1\nError reading file");
+        fclose(file);
+        return -1;
     }
 
     fclose(file);
@@ -98,73 +235,149 @@ int main(int argc, char **argv) {
 
     char buf[BUFSIZE];
 
-    uint32_t fsize;
+    uint32_t fsize, ftype;
 
-    /* check command line arguments */
+    // check command line arguments
     process_args(argc, argv);
 
-    /* socket: create the socket */
+    // create the socket
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) 
-        error("ERROR opening socket");
+        error("Status: 1\nERROR opening socket");
 
-    /* gethostbyname: get the server's DNS entry */
+    // get the server's DNS entry
+    // todo: change this when doing multithreading | not thread safe
     server = gethostbyname(hostname);
     if (server == NULL) {
-        fprintf(stderr,"ERROR, no such host as %s\n", hostname);
-        exit(0);
+        fprintf(stderr,"Status: 1\nERROR, no such host as %s\n", hostname);
+        exit(1);
     }
 
-    /* build the server's Internet address */
+    // build the server's internet address
     bzero((char *) &serveraddr, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
     bcopy((char *)server->h_addr, 
 	  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
     serveraddr.sin_port = htons(portno);
 
-    /* connect: create a connection with the server */
+    // create a connection with the server
     if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) 
-      error("ERROR connecting");
+      error("Status: 1\nERROR connecting");
 
-    /* get message line from the user */
+    // get message line from the user
     bzero(buf, BUFSIZE);
     printf("Please enter filename: ");
 
     if (fgets(buf, BUFSIZE, stdin) == NULL) {
-      printf("\nfgets failure...\n");
-      }
+      fprintf(stderr, "Status: 1\nERROR reading filename\n");
+      close(sockfd);
+      return 1;
+    }
  
-    // Strip newline character for fopen() to work
+    // strip newline character for fopen() to work
     buf[strcspn(buf, "\n")] = '\0';
 
     // compute and send file size.
     fsize = get_file_size(buf); 
-
-    //printf("DEBUG file size is %d\n", fsize);
-
-    /* send: send the file size to the server*/
+    if (fsize <= 0) {
+      fprintf(stderr, "Status: 1\nERROR: unable to read a non-empty input file\n");
+      close(sockfd);
+      return 1;
+    }
+    /* send the file size to the server*/
     uint32_t net_fsize = htonl(fsize);
+    if (send_all(sockfd, &net_fsize, sizeof(net_fsize)) < 0)
+      error("Status: 1\nERROR sending file size to socket");
 
-    n = send(sockfd, &net_fsize, sizeof(net_fsize), 0);
-
+    // compute and send file type.
+    ftype = (uint32_t)get_file_type(buf);
+    /* send the file type to the server*/
+    uint32_t net_ftype = htonl(ftype);
+    n = send(sockfd, &net_ftype, sizeof(net_ftype), 0);
     if (n < 0) 
-      error("ERROR sending to socket");
-
+      error("ERROR sending file type to socket");
+    
     // now read file content into buf and send it to server.
-    n = send_file(sockfd, buf); // TODO: same with fopen call here too. as line 153 buf); 
-    if (n < 0) 
-      error("ERROR writing to socket");
+    n = send_file(sockfd, buf);
+    if (n < 0){
+      error("Status: 1\nERROR writing data to socket");
+    }
+    
+    uint32_t net_status, net_payload_len;
+    int result = recv_all(sockfd, &net_status, sizeof(net_status));
+    if (result != 1) {
+      fprintf(stderr, "Status: 1\nERROR receiving response status%s\n",
+              result == 0 ? ": server disconnected" : "");
+      close(sockfd);
+      return 1;
+    }
 
-    /* Part2: recv: print the server's reply - url from QR code or error messages. */
-    /* TODO: enable in part 2, for QRCode url, switch to recv instead of read.*/
-    /* TODO: To be implemented in phase2 */
-    /*
-    bzero(buf, BUFSIZE);
-    n = read(sockfd, buf, BUFSIZE);
-    if (n < 0) 
-      error("ERROR reading from socket");
-    printf("Echo from server: %s", buf);
-    */
+    uint32_t status = ntohl(net_status);
+    result = recv_all(sockfd, &net_payload_len, sizeof(net_payload_len));
+    if (result != 1) {
+      fprintf(stderr, "Status: 1\nERROR receiving response length%s\n",
+              result == 0 ? ": server disconnected" : "");
+      close(sockfd);
+      return 1;
+    }
+
+    uint32_t payload_len = ntohl(net_payload_len);
+    if (status > RESPONSE_STATUS_TEXT ||
+        (status == RESPONSE_STATUS_ERROR && payload_len != 0) ||
+        (status == RESPONSE_STATUS_URL && payload_len > MAX_PAYLOAD_SIZE) ||
+        (status == RESPONSE_STATUS_TEXT &&
+         payload_len > MAX_TEXT_RESPONSE_SIZE)) {
+      fprintf(stderr, "Status: 1\nERROR: invalid server response\n");
+      close(sockfd);
+      return 1;
+    }
+    if (status == RESPONSE_STATUS_ERROR) {
+      printf("Status: 1\n no URL returned.\n");
+      close(sockfd);
+      return 1;
+    }
+
+    uint8_t *payload = NULL;
+    if (payload_len > 0) {
+      payload = malloc(payload_len);
+      if (payload == NULL) {
+        perror("Status: 1\nERROR allocating response buffer");
+        close(sockfd);
+        return 1;
+      }
+    }
+
+    result = recv_all(sockfd, payload, payload_len);
+    if (result != 1) {
+      fprintf(stderr, "Status: 1\nERROR receiving QR payload%s\n",
+              result == 0 ? ": server disconnected" : "");
+      free(payload);
+      close(sockfd);
+      return 1;
+    }
+
+    if (status == RESPONSE_STATUS_TEXT) {
+      printf("Status: 0\nText file contents:\n");
+      if (fwrite(payload, 1, payload_len, stdout) != payload_len) {
+        perror("Status: 1\nERROR printing text response");
+        free(payload);
+        close(sockfd);
+        return 1;
+      }
+      if (payload_len == 0 || payload[payload_len - 1] != '\n')
+        putchar('\n');
+    } else {
+      printf("Status: 0\nURL (%u bytes): ", payload_len);
+      if (fwrite(payload, 1, payload_len, stdout) != payload_len) {
+        perror("Status: 1\nERROR printing QR payload");
+        free(payload);
+        close(sockfd);
+        return 1;
+      }
+      putchar('\n');
+    }
+
+    free(payload);
     close(sockfd);
     return 0;
 }

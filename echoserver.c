@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,6 +23,14 @@
 #define BUFSIZE 1024
 #define QSIZE 5
 
+#define FILE_TYPE_NEITHER = 0
+#define FILE_TYPE_IMAGE = 1
+#define FILE_TYPE_TEXT = 2
+
+#define  RESPONSE_STATUS_URL = 0
+#define  RESPONSE_STATUS_ERROR = 1
+#define RESPONSE_STATUS_TEXT = 2
+
 // default values for optional arguments.
 #define DEFAULT_PORT 2012
 #define DEFAULT_RATE_REQUESTS 3
@@ -37,12 +46,55 @@
 int portno = DEFAULT_PORT;
 // do same for all other args.
 
-/*
- * error - wrapper for perror
- */
+//wrapper for perror
 void error(char *msg) {
   perror(msg);
   exit(1);
+}
+
+static int send_all(int fd, const void *buffer, size_t length) {
+  size_t sent = 0;
+  while (sent < length) {
+    ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
+    if (result < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (result == 0)
+      return -1;
+    sent += (size_t)result;
+  }
+  return 0;
+}
+
+static int recv_all(int fd, void *buffer, size_t length) {
+  size_t received = 0;
+  while (received < length) {
+    ssize_t result = recv(fd, (char *)buffer + received, length - received, 0);
+    if (result < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (result == 0)
+      return 0;
+    received += (size_t)result;
+  }
+  return 1;
+}
+
+static int send_response(int fd, uint32_t status, const uint8_t *payload,
+                         uint32_t payload_len) {
+  uint32_t net_status = htonl(status);
+  uint32_t net_payload_len = htonl(payload_len);
+
+  if (send_all(fd, &net_status, sizeof(net_status)) < 0 ||
+      send_all(fd, &net_payload_len, sizeof(net_payload_len)) < 0)
+    return -1;
+  if (payload_len > 0 && send_all(fd, payload, payload_len) < 0)
+    return -1;
+  return 0;
 }
 
 // todo:: Phase 4
@@ -54,11 +106,11 @@ void process_args(int argc, char **argv) {
 }
 
 void process_client_request(int connfd, struct sockaddr_in clientaddr) {
-  uint32_t fsize;
+  uint32_t fsize, ftype;
 
-  char *hostaddrp; /* dotted decimal host addr string */
-  struct hostent *hostp; /* client host info */
-  int hostport; /* client port */
+  char *hostaddrp; // dotted decimal host addr string
+  struct hostent *hostp; // client host info
+  int hostport; // client port
 
 
   char hostname[NI_MAXHOST];
@@ -68,92 +120,106 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   int s = getnameinfo((struct sockaddr *)&clientaddr, sizeof(struct sockaddr_in),
                       hostname, sizeof(hostname),
                       portname, sizeof(portname),
-                      0); // Use NI_NAMEREQD flag if you want it to strictly fail without DNS
+                      0);
 
   printf("server established connection with %s:%s\n",
   hostname, portname);
 
-  // read: file size from the client
-  if (recv (connfd, &fsize, sizeof (uint32_t), 0) < 0) {
-    printf("ERROR reading fsize from socket");
+  // read file size from the client
+  int result = recv_all(connfd, &fsize, sizeof(fsize));
+  if (result != 1) {
+    fprintf(stderr, "Status: 1\nERROR reading fsize from socket%s\n",
+            result == 0 ? ": client disconnected" : "");
     return;
   }
   fsize = ntohl(fsize);
 
-  if (fsize > MAX_FILE_SZ) {
-    fprintf(stderr, "ERROR: oversized file: %u bytes\n", fsize);
+  result = recv_all(connfd, &ftype, sizeof(ftype));
+  if (result != 1) {
+    fprintf(stderr, "Status: 1\nERROR reading file type from socket%s\n",
+            result == 0 ? ": client disconnected" : "");
     return;
   }
-   
-  // get file content
-  //char buffer[fsize];
-  //buffer[fsize] = '\0';
-  
-  uint8_t *buffer = malloc(fsize);
+  ftype = ntohl(ftype);
 
-  if(buffer == NULL){
-    perror("Failed to allocate image buffer");
+  if (fsize == 0 || fsize > MAX_FILE_SZ) {
+    fprintf(stderr, "Status: 1\nERROR: oversized file: %u bytes\n", fsize);
+    send_response(connfd, 1, NULL, 0);
     return;
   }
-  
-  int  bytesActuallyReceived;
-  uint32_t bytesReceivedsoFar = 0;
-  while (bytesReceivedsoFar < fsize) {
-    bytesActuallyReceived = recv(connfd, buffer + bytesReceivedsoFar, fsize - bytesReceivedsoFar, 0);
-      // 1. Check for system/network errors
-      if (bytesActuallyReceived < 0) {
-          printf("Network error during recv");
-          free(buffer);
-          break;
-      }
-      
-      // 2. Check if the client disconnected too early
-      if (bytesActuallyReceived == 0) {
-          fprintf(stderr, "Error: Client closed connection prematurely at %u / %u bytes.\n", 
-                  bytesReceivedsoFar, fsize);
-          free(buffer);
-          break;
-      } 
-    bytesReceivedsoFar += bytesActuallyReceived;
+
+  uint8_t *buffer = malloc((size_t)fsize);
+  if (buffer == NULL) {
+    perror("Status: 1\nFailed to allocate image buffer");
+    send_response(connfd, 1, NULL, 0);
+    return;
   }
 
-  if (bytesReceivedsoFar == fsize) {
-      printf("SUCCESS: File completely received! Total bytes: %u / %u\n", bytesReceivedsoFar, fsize);
-      printf("%s\n", buffer);
-  } else {
-    printf("FAILURE: File transfer incomplete. Skipping file dump.\n");
-  } 
+  result = recv_all(connfd, buffer, (size_t)fsize);
+  if (result != 1) {
+    if (result == 0)
+      fprintf(stderr, "Status: 1\nERROR: client disconnected before sending all %u bytes\n", fsize);
+    else
+      perror("Status: 1\nERROR receiving binary file data");
+    free(buffer);
+    send_response(connfd, 1, NULL, 0);
+    return;
+  }
 
-  // TODO: call qr decoder here when ready
-  
-  //decoding an image into greyscale pixel array
+  printf("Status: 0\nSUCCESS: File completely received! Total bytes: %u\n", fsize);
+
+  if (ftype == FILE_TYPE_TEXT) {
+    int response_result =
+        send_response(connfd, RESPONSE_STATUS_TEXT, buffer, fsize);
+    free(buffer);
+    if (response_result < 0)
+      perror("Status: 1\nERROR sending response to client");
+    return;
+  }
+  else if (ftype != FILE_TYPE_IMAGE) {
+    fprintf(stderr, "Status: 1\nERROR: input file is neither an image nor text\n");
+    free(buffer);
+    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
+    return;
+  }
+
+  // decoding an image into greyscale pixel array
   int w, h, channels;
   uint8_t *pixels = stbi_load_from_memory(buffer, fsize, &w, &h, &channels, 1);
   free(buffer);
 
   if(!pixels){
-    fprintf(stderr, "Failed to decode image", stbi_failure_reason());
+    fprintf(stderr, "Status: 1\nFailed to decode image: %s\n", stbi_failure_reason());
+    send_response(connfd, 1, NULL, 0);
+    return;
   }
-
-  printf("Image: %d x %d\n", w, h);
   
   struct quirc *qr = quirc_new();\
 
   if(!qr){
-    perror("Failed to allocate memory");
+    perror("Status: 1\nFailed to allocate memory");
     stbi_image_free(pixels);
+    send_response(connfd, 1, NULL, 0);
     return;
   }
 
   if(quirc_resize(qr, w, h)){
-    perror("Failed to allocate video memory");
+    perror("Status: 1\nFailed to allocate video memory");
     quirc_destroy(qr);
     stbi_image_free(pixels);
+    send_response(connfd, 1, NULL, 0);
     return;
   }
 
-  int qw, qh;//get these from the passed image
+  int qw, qh; // get these from the passed image
   uint8_t *qimage = quirc_begin(qr, &qw, &qh);
+  if (!qimage) {
+    fprintf(stderr, "Status: 1\nFailed to obtain QR image buffer\n");
+    quirc_destroy(qr);
+    stbi_image_free(pixels);
+    send_response(connfd, 1, NULL, 0);
+    return;
+  }
   
   memcpy(qimage, pixels, (size_t)w*h);
   stbi_image_free(pixels);
@@ -162,6 +228,8 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   int num_codes = quirc_count(qr);
   printf("Found %d QR codes\n", num_codes);
 
+  const uint8_t *url = NULL;
+  uint32_t url_len = 0;
   for(int i = 0; i < num_codes; i++){
     struct quirc_code code;
     struct quirc_data data;
@@ -169,65 +237,72 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
 
     quirc_extract(qr, i, &code);
 
-    /* Decoding stage */
+    // Decoding stage
     err = quirc_decode(&code, &data);
-    if (err)
-        printf("DECODE FAILED: %s\n", quirc_strerror(err));
-    else
-        printf("Data: %s\n", data.payload);
+    if (err) {
+      printf("Status: 1\nDECODE FAILED: %s\n", quirc_strerror(err));
+
+    }
+    else {
+      printf("Data: %s\n", data.payload);
+      if (data.payload_len > 0 && data.payload_len <= MAX_URL_SZ) {
+        url = data.payload;
+        url_len = (uint32_t)data.payload_len;
+        break;
+      }
+      fprintf(stderr, "QR payload is empty or exceeds %d bytes\n", MAX_URL_SZ);
+    }
   }
 
-  quirc_destroy(qr);
+  if (send_response(connfd, url ? RESPONSE_STATUS_URL : RESPONSE_STATUS_ERROR,
+                    url, url_len) < 0)
+    perror("Status: 1\nERROR sending response to client");
 
+  quirc_destroy(qr);
 }
 
 int main(int argc, char **argv) {
-  int listenfd; /* listening socket */
-  int connfd; /* connection socket */
-  socklen_t clientlen ; /* byte size of client's address */
-  struct sockaddr_in serveraddr; /* server's addr */
-  struct sockaddr_in clientaddr; /* client addr */
-  int optval; /* flag value for setsockopt */
-  /* check command line args */
+  int listenfd; // listening socket
+  int connfd; // connection socket
+  socklen_t clientlen ; // byte size of client's address
+  struct sockaddr_in serveraddr; // server's addr
+  struct sockaddr_in clientaddr; // client addr
+  int optval; // flag value for setsockopt
+
+  // check command line args
   process_args(argc, argv);
 
-  /* socket: create a socket */
+  // create a socket
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
   if (listenfd < 0)
-    error("ERROR opening socket");
+    error("Status: 1\nERROR opening socket");
 
-  /* setsockopt: Handy debugging trick that lets
-   * us rerun the server immediately after we kill it;
-   * otherwise we have to wait about 20 secs.
-   * Eliminates "ERROR on binding: Address already in use" error.
-   */
   optval = 1;
   setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,
 	     (const void *)&optval , sizeof(int));
 
-  /* build the server's internet address */
+  // build the server's internet address 
   bzero((char *) &serveraddr, sizeof(serveraddr));
-  serveraddr.sin_family = AF_INET; /* we are using the Internet */
-  serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); /* accept reqs to any IP addr */
-  serveraddr.sin_port = htons((unsigned short)portno); /* port to listen on */
+  serveraddr.sin_family = AF_INET; // we are using the Internet
+  serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); // accept reqs to any IP addr
+  serveraddr.sin_port = htons((unsigned short)portno); // port to listen on
 
-  /* bind: associate the listening socket with a port */
+  // bind the listening socket to a port
   if (bind(listenfd, (struct sockaddr *) &serveraddr,
 	   sizeof(serveraddr)) < 0)
-    error("ERROR on binding");
+    error("Status: 1\nERROR on binding");
 
-  /* listen: make it a listening socket ready to accept connection requests */
-  if (listen(listenfd, QSIZE) < 0) /* allow n requests to queue up */
-    error("ERROR on listen");
+  // make it a listening socket ready to accept connection requests
+  if (listen(listenfd, QSIZE) < 0) // allow n requests to queue up
+    error("Status: 1\nERROR on listen");
 
-  /* main loop: wait for a connection request, echo input line,
-     then close connection. */
+  // wait for a connection request, echo input line, then close connection.
   clientlen = sizeof(clientaddr);
   while (1) {
-    /* accept: wait for a connection request */
+    // wait for a connection request 
     connfd = accept(listenfd, (struct sockaddr *) &clientaddr, &clientlen);
     if (connfd < 0)
-      error("ERROR on accept");
+      error("Status: 1\nERROR on accept");
 
     process_client_request(connfd, clientaddr);
 
