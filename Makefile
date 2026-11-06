@@ -1,6 +1,6 @@
 # Compiler and flags
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -I quirc-master/lib
+CFLAGS  = -Wall -Wextra -O2 -I quirc-master/lib -pthread
 LDLIBS  = -lm
 
 # Directories

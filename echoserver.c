@@ -14,6 +14,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <signal.h>
+#include <pthread.h>
 
 #include "quirc-master/lib/quirc.h"
 
@@ -23,13 +25,13 @@
 #define BUFSIZE 1024
 #define QSIZE 5
 
-#define FILE_TYPE_NEITHER = 0
-#define FILE_TYPE_IMAGE = 1
-#define FILE_TYPE_TEXT = 2
+#define FILE_TYPE_NEITHER 0
+#define FILE_TYPE_IMAGE 1
+#define FILE_TYPE_TEXT 2
 
-#define  RESPONSE_STATUS_URL = 0
-#define  RESPONSE_STATUS_ERROR = 1
-#define RESPONSE_STATUS_TEXT = 2
+#define RESPONSE_STATUS_URL 0
+#define RESPONSE_STATUS_ERROR 1
+#define RESPONSE_STATUS_TEXT 2
 
 // default values for optional arguments.
 #define DEFAULT_PORT 2012
@@ -42,9 +44,18 @@
 #define MAX_FILE_SZ 20*1024*1024 // max for qr file
 #define MAX_URL_SZ  200 // in characters
 
+struct client_context {
+  int connfd;
+  struct sockaddr_in clientaddr;
+};
+
 // initialize all config parameters
 int portno = DEFAULT_PORT;
 // do same for all other args.
+
+/* stb_image keeps its failure reason in shared global state. */
+static pthread_mutex_t stbi_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //wrapper for perror
 void error(char *msg) {
@@ -169,6 +180,23 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   printf("Status: 0\nSUCCESS: File completely received! Total bytes: %u\n", fsize);
 
   if (ftype == FILE_TYPE_TEXT) {
+    int mutex_result = pthread_mutex_lock(&stdout_mutex);
+    if (mutex_result != 0) {
+      fprintf(stderr, "ERROR locking stdout mutex: %s\n",
+              strerror(mutex_result));
+    } else {
+      printf("Received text file contents (%u bytes):\n", fsize);
+      if (fwrite(buffer, 1, fsize, stdout) != fsize)
+        perror("ERROR printing received text file");
+      if (fsize == 0 || buffer[fsize - 1] != '\n')
+        putchar('\n');
+      fflush(stdout);
+      mutex_result = pthread_mutex_unlock(&stdout_mutex);
+      if (mutex_result != 0)
+        fprintf(stderr, "ERROR unlocking stdout mutex: %s\n",
+                strerror(mutex_result));
+    }
+
     int response_result =
         send_response(connfd, RESPONSE_STATUS_TEXT, buffer, fsize);
     free(buffer);
@@ -185,11 +213,31 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
 
   // decoding an image into greyscale pixel array
   int w, h, channels;
+  int mutex_result = pthread_mutex_lock(&stbi_mutex);
+  if (mutex_result != 0) {
+    fprintf(stderr, "ERROR locking image decoder mutex: %s\n",
+            strerror(mutex_result));
+    free(buffer);
+    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
+    return;
+  }
   uint8_t *pixels = stbi_load_from_memory(buffer, fsize, &w, &h, &channels, 1);
+  if (!pixels)
+    fprintf(stderr, "Status: 1\nFailed to decode image: %s\n",
+            stbi_failure_reason());
+  mutex_result = pthread_mutex_unlock(&stbi_mutex);
+  if (mutex_result != 0) {
+    fprintf(stderr, "ERROR unlocking image decoder mutex: %s\n",
+            strerror(mutex_result));
+    if (pixels)
+      stbi_image_free(pixels);
+    free(buffer);
+    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
+    return;
+  }
   free(buffer);
 
   if(!pixels){
-    fprintf(stderr, "Status: 1\nFailed to decode image: %s\n", stbi_failure_reason());
     send_response(connfd, 1, NULL, 0);
     return;
   }
@@ -261,6 +309,17 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   quirc_destroy(qr);
 }
 
+static void *client_thread(void *arg) {
+  struct client_context *context = arg;
+  int connfd = context->connfd;
+  struct sockaddr_in clientaddr = context->clientaddr;
+  free(context);
+
+  process_client_request(connfd, clientaddr);
+  close(connfd);
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   int listenfd; // listening socket
   int connfd; // connection socket
@@ -268,9 +327,32 @@ int main(int argc, char **argv) {
   struct sockaddr_in serveraddr; // server's addr
   struct sockaddr_in clientaddr; // client addr
   int optval; // flag value for setsockopt
+  struct sigaction action; // for signal handling in multithreaded server
+  pthread_attr_t thread_attr;
 
   // check command line args
   process_args(argc, argv);
+
+  memset(&action, 0, sizeof(action)); // initialize action struct to 0
+  action.sa_handler = SIG_IGN; // ignore signal
+  sigemptyset(&action.sa_mask); 
+  if (sigaction(SIGPIPE, &action, NULL) < 0)
+    error("Status: 1\nERROR configuring signals");
+
+  int thread_result = pthread_attr_init(&thread_attr);
+  if (thread_result != 0) {
+    fprintf(stderr, "ERROR initializing thread attributes: %s\n",
+            strerror(thread_result));
+    return 1;
+  }
+  thread_result = pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
+  
+  if (thread_result != 0) {
+    fprintf(stderr, "ERROR configuring detached threads: %s\n",
+            strerror(thread_result));
+    pthread_attr_destroy(&thread_attr);
+    return 1;
+  }
 
   // create a socket
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -297,15 +379,34 @@ int main(int argc, char **argv) {
     error("Status: 1\nERROR on listen");
 
   // wait for a connection request, echo input line, then close connection.
-  clientlen = sizeof(clientaddr);
   while (1) {
     // wait for a connection request 
+    clientlen = sizeof(clientaddr);
     connfd = accept(listenfd, (struct sockaddr *) &clientaddr, &clientlen);
-    if (connfd < 0)
-      error("Status: 1\nERROR on accept");
+    if (connfd < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("Status: 1\nERROR on accept");
+      continue;
+    }
 
-    process_client_request(connfd, clientaddr);
+    struct client_context *context = malloc(sizeof(*context));
+    if (context == NULL) {
+      perror("Status: 1\nERROR allocating client context");
+      close(connfd);
+      continue;
+    }
+    context->connfd = connfd;
+    context->clientaddr = clientaddr;
 
-    close(connfd);
+    pthread_t worker;
+    thread_result = pthread_create(&worker, &thread_attr, client_thread,
+                                   context);
+    if (thread_result != 0) {
+      fprintf(stderr, "Status: 1\nERROR creating client worker: %s\n",
+              strerror(thread_result));
+      free(context);
+      close(connfd);
+    }
   }
 }

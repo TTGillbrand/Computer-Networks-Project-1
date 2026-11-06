@@ -19,30 +19,77 @@
 #define MAX_PAYLOAD_SIZE 8896
 #define MAX_TEXT_RESPONSE_SIZE (20U * 1024U * 1024U)
 
-#define FILE_TYPE_NEITHER = 0,
-#define FILE_TYPE_IMAGE = 1,
-#define FILE_TYPE_TEXT = 2
+#define FILE_TYPE_NEITHER 0
+#define FILE_TYPE_IMAGE 1
+#define FILE_TYPE_TEXT 2
 
-#define RESPONSE_STATUS_URL = 0,
-#define RESPONSE_STATUS_ERROR = 1,
-#define RESPONSE_STATUS_TEXT = 2
+#define RESPONSE_STATUS_URL 0
+#define RESPONSE_STATUS_ERROR 1
+#define RESPONSE_STATUS_TEXT 2
 
-// error - wrapper for perror
-char *hostname;;
-int portno;
+struct client_config {
+    char hostname[256];
+    int portno;
+};
 
-void error(char *msg) {
+static int error(const char *msg) {
     perror(msg);
-    exit(1);
+    return 1;
 }
 
-void process_args(int argc, char **argv) {
+static int process_args(int argc, char **argv, struct client_config *cfg) {
+    char *end = NULL;
+    long port = 0;
+
     if (argc != 3) {
        fprintf(stderr,"usage: %s <hostname> <port>\n", argv[0]);
-       exit(1);
+       return 1;
     }
-    hostname = argv[1];
-    portno = atoi(argv[2]);
+
+    snprintf(cfg->hostname, sizeof(cfg->hostname), "%s", argv[1]);
+
+    port = strtol(argv[2], &end, 10);
+    if (end == argv[2] || *end != '\0' || port < 1 || port > 65535) {
+        fprintf(stderr, "Status: 1\nERROR: invalid port number '%s'\n", argv[2]);
+        return 1;
+    }
+
+    cfg->portno = (int)port;
+    return 0;
+}
+
+static int resolve_server_address(const char *hostname, int portno,
+                                 struct sockaddr_in *serveraddr) {
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    struct addrinfo *rp = NULL;
+    char service[32];
+    int status;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    snprintf(service, sizeof(service), "%d", portno);
+    status = getaddrinfo(hostname, service, &hints, &result);
+    if (status != 0) {
+        fprintf(stderr, "Status: 1\nERROR, no such host as %s: %s\n",
+                hostname, gai_strerror(status));
+        return -1;
+    }
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET && rp->ai_socktype == SOCK_STREAM) {
+            memset(serveraddr, 0, sizeof(*serveraddr));
+            memcpy(serveraddr, rp->ai_addr, sizeof(*serveraddr));
+            freeaddrinfo(result);
+            return 0;
+        }
+    }
+
+    freeaddrinfo(result);
+    fprintf(stderr, "Status: 1\nERROR, no valid IPv4 address found for %s\n", hostname);
+    return -1;
 }
 
 static int send_all(int fd, const void *buffer, size_t length) {
@@ -231,38 +278,35 @@ int send_file(int sockfd, const char *filename) {
 int main(int argc, char **argv) {
     int sockfd,  n;
     struct sockaddr_in serveraddr;
-    struct hostent *server;
+    struct client_config config;
 
     char buf[BUFSIZE];
 
     uint32_t fsize, ftype;
 
     // check command line arguments
-    process_args(argc, argv);
+    if (process_args(argc, argv, &config) != 0) {
+        return 1;
+    }
 
     // create the socket
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) 
-        error("Status: 1\nERROR opening socket");
-
-    // get the server's DNS entry
-    // todo: change this when doing multithreading | not thread safe
-    server = gethostbyname(hostname);
-    if (server == NULL) {
-        fprintf(stderr,"Status: 1\nERROR, no such host as %s\n", hostname);
-        exit(1);
+    if (sockfd < 0) {
+        return error("Status: 1\nERROR opening socket");
     }
 
-    // build the server's internet address
-    bzero((char *) &serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    bcopy((char *)server->h_addr, 
-	  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
-    serveraddr.sin_port = htons(portno);
+    // resolve the server address
+    if (resolve_server_address(config.hostname, config.portno, &serveraddr) != 0) {
+        close(sockfd);
+        return 1;
+    }
 
     // create a connection with the server
-    if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) 
-      error("Status: 1\nERROR connecting");
+    if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) {
+        perror("Status: 1\nERROR connecting");
+        close(sockfd);
+        return 1;
+    }
 
     // get message line from the user
     bzero(buf, BUFSIZE);
@@ -286,21 +330,29 @@ int main(int argc, char **argv) {
     }
     /* send the file size to the server*/
     uint32_t net_fsize = htonl(fsize);
-    if (send_all(sockfd, &net_fsize, sizeof(net_fsize)) < 0)
-      error("Status: 1\nERROR sending file size to socket");
+    if (send_all(sockfd, &net_fsize, sizeof(net_fsize)) < 0) {
+      fprintf(stderr, "Status: 1\nERROR sending file size to socket\n");
+      close(sockfd);
+      return 1;
+    }
 
     // compute and send file type.
     ftype = (uint32_t)get_file_type(buf);
     /* send the file type to the server*/
     uint32_t net_ftype = htonl(ftype);
     n = send(sockfd, &net_ftype, sizeof(net_ftype), 0);
-    if (n < 0) 
-      error("ERROR sending file type to socket");
+    if (n < 0) {
+      perror("Status: 1\nERROR sending file type to socket");
+      close(sockfd);
+      return 1;
+    }
     
     // now read file content into buf and send it to server.
     n = send_file(sockfd, buf);
     if (n < 0){
-      error("Status: 1\nERROR writing data to socket");
+      fprintf(stderr, "Status: 1\nERROR writing data to socket\n");
+      close(sockfd);
+      return 1;
     }
     
     uint32_t net_status, net_payload_len;
