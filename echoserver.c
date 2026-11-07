@@ -32,6 +32,7 @@
 #define RESPONSE_STATUS_URL 0
 #define RESPONSE_STATUS_ERROR 1
 #define RESPONSE_STATUS_TEXT 2
+#define RESPONSE_STATUS_READY 3
 
 // default values for optional arguments.
 #define DEFAULT_PORT 2012
@@ -108,6 +109,56 @@ static int send_response(int fd, uint32_t status, const uint8_t *payload,
   return 0;
 }
 
+static int send_error_response(int fd, const char *message) {
+  return send_response(fd, RESPONSE_STATUS_ERROR, (const uint8_t *)message,
+                       (uint32_t)strlen(message));
+}
+
+static int is_valid_text(const uint8_t *data, size_t length) {
+  int remaining_utf8 = 0;
+  uint8_t next_min = 0x80;
+  uint8_t next_max = 0xBF;
+
+  for (size_t i = 0; i < length; i++) {
+    uint8_t byte = data[i];
+    if (remaining_utf8 > 0) {
+      if (byte < next_min || byte > next_max)
+        return 0;
+      remaining_utf8--;
+      next_min = 0x80;
+      next_max = 0xBF;
+    } else if (byte <= 0x7F) {
+      if (byte != '\t' && byte != '\n' && byte != '\v' &&
+          byte != '\f' && byte != '\r' &&
+          (byte < 0x20 || byte == 0x7F))
+        return 0;
+    } else if (byte >= 0xC2 && byte <= 0xDF) {
+      remaining_utf8 = 1;
+    } else if (byte == 0xE0) {
+      remaining_utf8 = 2;
+      next_min = 0xA0;
+    } else if ((byte >= 0xE1 && byte <= 0xEC) ||
+               (byte >= 0xEE && byte <= 0xEF)) {
+      remaining_utf8 = 2;
+    } else if (byte == 0xED) {
+      remaining_utf8 = 2;
+      next_max = 0x9F;
+    } else if (byte == 0xF0) {
+      remaining_utf8 = 3;
+      next_min = 0x90;
+    } else if (byte >= 0xF1 && byte <= 0xF3) {
+      remaining_utf8 = 3;
+    } else if (byte == 0xF4) {
+      remaining_utf8 = 3;
+      next_max = 0x8F;
+    } else {
+      return 0;
+    }
+  }
+
+  return remaining_utf8 == 0;
+}
+
 // todo:: Phase 4
 void process_args(int argc, char **argv) {
   // initialize all argumesnts.
@@ -153,16 +204,27 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   }
   ftype = ntohl(ftype);
 
-  if (fsize == 0 || fsize > MAX_FILE_SZ) {
-    fprintf(stderr, "Status: 1\nERROR: oversized file: %u bytes\n", fsize);
-    send_response(connfd, 1, NULL, 0);
+  if (fsize > MAX_FILE_SZ) {
+    fprintf(stderr, "Status: 1\nERROR: file too large: %u bytes (maximum %u)\n",
+            fsize, (unsigned int)MAX_FILE_SZ);
+    send_error_response(connfd, "File is too large for the server.");
+    return;
+  }
+  if (fsize == 0 || (ftype != FILE_TYPE_IMAGE && ftype != FILE_TYPE_TEXT)) {
+    fprintf(stderr, "Status: 1\nERROR: invalid or unsupported file\n");
+    send_error_response(connfd, "File is empty or is not a supported image or text file.");
+    return;
+  }
+
+  if (send_response(connfd, RESPONSE_STATUS_READY, NULL, 0) < 0) {
+    perror("Status: 1\nERROR acknowledging upload");
     return;
   }
 
   uint8_t *buffer = malloc((size_t)fsize);
   if (buffer == NULL) {
     perror("Status: 1\nFailed to allocate image buffer");
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "Server could not allocate memory for the upload.");
     return;
   }
 
@@ -173,13 +235,20 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     else
       perror("Status: 1\nERROR receiving binary file data");
     free(buffer);
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "Server did not receive the complete file.");
     return;
   }
 
   printf("Status: 0\nSUCCESS: File completely received! Total bytes: %u\n", fsize);
 
   if (ftype == FILE_TYPE_TEXT) {
+    if (!is_valid_text(buffer, fsize)) {
+      fprintf(stderr, "Status: 1\nERROR: received text file is not valid UTF-8 text\n");
+      free(buffer);
+      send_error_response(connfd, "File is not valid UTF-8 text.");
+      return;
+    }
+
     int mutex_result = pthread_mutex_lock(&stdout_mutex);
     if (mutex_result != 0) {
       fprintf(stderr, "ERROR locking stdout mutex: %s\n",
@@ -204,12 +273,6 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
       perror("Status: 1\nERROR sending response to client");
     return;
   }
-  else if (ftype != FILE_TYPE_IMAGE) {
-    fprintf(stderr, "Status: 1\nERROR: input file is neither an image nor text\n");
-    free(buffer);
-    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
-    return;
-  }
 
   // decoding an image into greyscale pixel array
   int w, h, channels;
@@ -218,7 +281,7 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     fprintf(stderr, "ERROR locking image decoder mutex: %s\n",
             strerror(mutex_result));
     free(buffer);
-    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
+    send_error_response(connfd, "Server could not process the image.");
     return;
   }
   uint8_t *pixels = stbi_load_from_memory(buffer, fsize, &w, &h, &channels, 1);
@@ -232,13 +295,13 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     if (pixels)
       stbi_image_free(pixels);
     free(buffer);
-    send_response(connfd, RESPONSE_STATUS_ERROR, NULL, 0);
+    send_error_response(connfd, "Server could not process the image.");
     return;
   }
   free(buffer);
 
   if(!pixels){
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "File is not a valid image containing a QR code.");
     return;
   }
   
@@ -247,7 +310,7 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   if(!qr){
     perror("Status: 1\nFailed to allocate memory");
     stbi_image_free(pixels);
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "Server could not allocate memory to decode the QR code.");
     return;
   }
 
@@ -255,7 +318,7 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     perror("Status: 1\nFailed to allocate video memory");
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "Server could not decode the QR image.");
     return;
   }
 
@@ -265,7 +328,7 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     fprintf(stderr, "Status: 1\nFailed to obtain QR image buffer\n");
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_response(connfd, 1, NULL, 0);
+    send_error_response(connfd, "Server could not decode the QR image.");
     return;
   }
   
@@ -276,8 +339,9 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
   int num_codes = quirc_count(qr);
   printf("Found %d QR codes\n", num_codes);
 
-  const uint8_t *url = NULL;
+  uint8_t url[MAX_URL_SZ];
   uint32_t url_len = 0;
+  int have_url = 0;
   for(int i = 0; i < num_codes; i++){
     struct quirc_code code;
     struct quirc_data data;
@@ -294,16 +358,23 @@ void process_client_request(int connfd, struct sockaddr_in clientaddr) {
     else {
       printf("Data: %s\n", data.payload);
       if (data.payload_len > 0 && data.payload_len <= MAX_URL_SZ) {
-        url = data.payload;
+        memcpy(url, data.payload, data.payload_len);
         url_len = (uint32_t)data.payload_len;
+        have_url = 1;
         break;
       }
       fprintf(stderr, "QR payload is empty or exceeds %d bytes\n", MAX_URL_SZ);
     }
   }
 
-  if (send_response(connfd, url ? RESPONSE_STATUS_URL : RESPONSE_STATUS_ERROR,
-                    url, url_len) < 0)
+  int response_result;
+  if (have_url) {
+    response_result = send_response(connfd, RESPONSE_STATUS_URL, url, url_len);
+  } else {
+    response_result = send_error_response(
+        connfd, "Image does not contain a valid QR code with a supported payload.");
+  }
+  if (response_result < 0)
     perror("Status: 1\nERROR sending response to client");
 
   quirc_destroy(qr);
