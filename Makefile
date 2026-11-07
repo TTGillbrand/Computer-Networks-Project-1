@@ -8,13 +8,17 @@ QUIRC_SRC = $(wildcard quirc-master/lib/*.c)
 QUIRC_OBJ = $(QUIRC_SRC:.c=.o)
 
 # Target executables
-TARGETS = echoserver echoclient
+TARGETS = QRServer echoserver echoclient
 
 # Default rule to build everything
 all: $(TARGETS)
 
 # Rule to build the server executable
 echoserver: echoserver.o $(QUIRC_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Server executable name.
+QRServer: echoserver.o $(QUIRC_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Rule to build the client executable
