@@ -19,13 +19,13 @@
 #define MAX_PAYLOAD_SIZE 8896
 #define MAX_TEXT_RESPONSE_SIZE (20U * 1024U * 1024U)
 
-#define FILE_TYPE_NEITHER = 0,
-#define FILE_TYPE_IMAGE = 1,
-#define FILE_TYPE_TEXT = 2
+#define FILE_TYPE_NEITHER 0
+#define FILE_TYPE_IMAGE 1
+#define FILE_TYPE_TEXT 2
 
-#define RESPONSE_STATUS_URL = 0,
-#define RESPONSE_STATUS_ERROR = 1,
-#define RESPONSE_STATUS_TEXT = 2
+#define RESPONSE_STATUS_URL 0
+#define RESPONSE_STATUS_ERROR 1
+#define RESPONSE_STATUS_TEXT 2
 
 // error - wrapper for perror
 char *hostname;;
@@ -264,6 +264,8 @@ int main(int argc, char **argv) {
     if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) 
       error("Status: 1\nERROR connecting");
 
+    
+    while(1){
     // get message line from the user
     bzero(buf, BUFSIZE);
     printf("Please enter filename: ");
@@ -376,8 +378,9 @@ int main(int argc, char **argv) {
       }
       putchar('\n');
     }
-
     free(payload);
+    }
     close(sockfd);
+    
     return 0;
 }
