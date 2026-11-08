@@ -1,386 +1,433 @@
-/* 
+/*
  * echoclient.c - A simple connection-based client
  * usage: echoclient <host> <port>
  */
+
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h> 
-#include <sys/stat.h>
+#include <sys/select.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define BUFSIZE 1024
-#define MAX_PAYLOAD_SIZE 8896
-#define MAX_TEXT_RESPONSE_SIZE (20U * 1024U * 1024U)
 
+// max values to protect server
+#define MAX_FILE_SZ (20U * 1024U * 1024U)
+#define MAX_URL_SZ 200
 #define FILE_TYPE_NEITHER 0
 #define FILE_TYPE_IMAGE 1
 #define FILE_TYPE_TEXT 2
 
-#define RESPONSE_STATUS_URL 0
+#define RESPONSE_STATUS_ACCEPTED 0
 #define RESPONSE_STATUS_ERROR 1
 #define RESPONSE_STATUS_TEXT 2
+#define RESPONSE_STATUS_READY 3
 
-// error - wrapper for perror
-char *hostname;;
-int portno;
+struct client_config {
+  char hostname[256];
+  int portno;
+};
 
-void error(char *msg) {
-    perror(msg);
-    exit(1);
-}
+// process user input
+static int process_args(int argc, char **argv, struct client_config *cfg) {
+  char *end = NULL;
+  long port;
 
-void process_args(int argc, char **argv) {
-    if (argc != 3) {
-       fprintf(stderr,"usage: %s <hostname> <port>\n", argv[0]);
-       exit(1);
-    }
-    hostname = argv[1];
-    portno = atoi(argv[2]);
+  if (argc != 3) {
+    fprintf(stderr, "usage: %s <hostname> <port>\n", argv[0]);
+    return 1;
+  }
+
+  // check for invalid port number
+  snprintf(cfg->hostname, sizeof(cfg->hostname), "%s", argv[1]);
+  port = strtol(argv[2], &end, 10);
+  if (end == argv[2] || *end != '\0' || port < 1 || port > 65535) {
+    fprintf(stderr, "Status: 1\nERROR: invalid port number '%s'\n", argv[2]);
+    return 1;
+  }
+
+  cfg->portno = (int)port;
+  return 0;
 }
 
 static int send_all(int fd, const void *buffer, size_t length) {
-    size_t sent = 0;
-    while (sent < length) {
-        ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
-        if (result < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (result == 0)
-            return -1;
-        sent += (size_t)result;
+  size_t sent = 0;
+  while (sent < length) {
+    ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
+    if (result < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
     }
-    return 0;
+    if (result == 0)
+      return -1;
+    sent += (size_t)result;
+  }
+  return 0;
 }
 
 static int recv_all(int fd, void *buffer, size_t length) {
-    size_t received = 0;
-    while (received < length) {
-        ssize_t result = recv(fd, (char *)buffer + received, length - received, 0);
-        if (result < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (result == 0)
-            return 0;
-        received += (size_t)result;
+  size_t received = 0;
+  while (received < length) {
+    ssize_t result = recv(fd, (char *)buffer + received, length - received, 0);
+    if (result < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
     }
-    return 1;
+    if (result == 0)
+      return 0;
+    received += (size_t)result;
+  }
+  return 1;
 }
 
-int32_t get_file_size(const char *filename) {
-    FILE *fp = fopen(filename, "rb"); 
-    if (fp == NULL) {
-        return -1; 
-    }
-
-    // Move pointer to the end of the file
-    if (fseek(fp, 0L, SEEK_END) != 0) {
-        fclose(fp);
-        return -1;
-    }
-
-    // Get the current position (which matches total bytes)
-    long size = ftell(fp); 
-
-    fclose(fp);
-    return (int32_t) size;
-}
-
-int32_t get_file_type(const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL)
-        return FILE_TYPE_NEITHER;
-
-    unsigned char header[12];
-    size_t header_size = fread(header, 1, sizeof(header), file);
-    int is_image =
-        (header_size >= 3 && header[0] == 0xFF &&
-         header[1] == 0xD8 && header[2] == 0xFF) ||
-        (header_size >= 8 &&
-         memcmp(header, "\x89PNG\r\n\x1A\n", 8) == 0) ||
-        (header_size >= 6 &&
-         (memcmp(header, "GIF87a", 6) == 0 ||
-          memcmp(header, "GIF89a", 6) == 0)) ||
-        (header_size >= 2 && memcmp(header, "BM", 2) == 0) ||
-        (header_size >= 4 &&
-         (memcmp(header, "II*\0", 4) == 0 ||
-          memcmp(header, "MM\0*", 4) == 0)) ||
-        (header_size >= 12 && memcmp(header, "RIFF", 4) == 0 &&
-         memcmp(header + 8, "WEBP", 4) == 0);
-
-    if (is_image) {
-        fclose(file);
-        return FILE_TYPE_IMAGE;
-    }
-
-    if (ferror(file) || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return FILE_TYPE_NEITHER;
-    }
-
-    int remaining_utf8 = 0;
-    unsigned char next_min = 0x80;
-    unsigned char next_max = 0xBF;
-    unsigned char buffer[BUFSIZE];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        for (size_t i = 0; i < bytes_read; i++) {
-            unsigned char byte = buffer[i];
-            if (remaining_utf8 > 0) {
-                if (byte < next_min || byte > next_max)
-                    goto not_text;
-                remaining_utf8--;
-                next_min = 0x80;
-                next_max = 0xBF;
-            } else if (byte <= 0x7F) {
-                if (byte != '\t' && byte != '\n' && byte != '\v' &&
-                    byte != '\f' && byte != '\r' &&
-                    (byte < 0x20 || byte == 0x7F))
-                    goto not_text;
-            } else if (byte >= 0xC2 && byte <= 0xDF) {
-                remaining_utf8 = 1;
-            } else if (byte == 0xE0) {
-                remaining_utf8 = 2;
-                next_min = 0xA0;
-            } else if ((byte >= 0xE1 && byte <= 0xEC) ||
-                       (byte >= 0xEE && byte <= 0xEF)) {
-                remaining_utf8 = 2;
-            } else if (byte == 0xED) {
-                remaining_utf8 = 2;
-                next_max = 0x9F;
-            } else if (byte == 0xF0) {
-                remaining_utf8 = 3;
-                next_min = 0x90;
-            } else if (byte >= 0xF1 && byte <= 0xF3) {
-                remaining_utf8 = 3;
-            } else if (byte == 0xF4) {
-                remaining_utf8 = 3;
-                next_max = 0x8F;
-            } else {
-                goto not_text;
-            }
-        }
-    }
-
-    if (ferror(file) || remaining_utf8 != 0)
-        goto not_text;
-
-    fclose(file);
-    return FILE_TYPE_TEXT;
-
-not_text:
-    fclose(file);
+static int get_file_type(FILE *file) {
+  unsigned char header[12];
+  if (fseek(file, 0, SEEK_SET) != 0)
     return FILE_TYPE_NEITHER;
+
+  // read the file’s initial bytes and checks for signatures identifying common image formats, 
+  // including JPEG, PNG, GIF, BMP, TIFF, and WebP. If one matches, return FILE_TYPE_IMAGE.
+  size_t header_size = fread(header, 1, sizeof(header), file);
+  int is_image =
+      (header_size >= 3 && header[0] == 0xFF &&
+       header[1] == 0xD8 && header[2] == 0xFF) ||
+      (header_size >= 8 &&
+       memcmp(header, "\x89PNG\r\n\x1A\n", 8) == 0) ||
+      (header_size >= 6 &&
+       (memcmp(header, "GIF87a", 6) == 0 ||
+        memcmp(header, "GIF89a", 6) == 0)) ||
+      (header_size >= 2 && memcmp(header, "BM", 2) == 0) ||
+      (header_size >= 4 &&
+       (memcmp(header, "II*\0", 4) == 0 ||
+        memcmp(header, "MM\0*", 4) == 0)) ||
+      (header_size >= 12 && memcmp(header, "RIFF", 4) == 0 &&
+       memcmp(header + 8, "WEBP", 4) == 0);
+  if (is_image)
+    return FILE_TYPE_IMAGE;
+
+  if (ferror(file) || fseek(file, 0, SEEK_SET) != 0)
+    return FILE_TYPE_NEITHER;
+
+  int remaining_utf8 = 0;
+  unsigned char next_min = 0x80;
+  unsigned char next_max = 0xBF;
+  unsigned char buffer[BUFSIZE];
+  size_t bytes_read;
+
+  // scan the whole file to see whether it contains valid UTF-8 text, allowing 
+  // common whitespace but rejecting invalid UTF-8 and control characters. If valid, 
+  // return FILE_TYPE_TEXT. If can’t read or rewind the file, or the contents match neither 
+  // category, return FILE_TYPE_NEITHER.
+  while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    for (size_t i = 0; i < bytes_read; i++) {
+      unsigned char byte = buffer[i];
+      if (remaining_utf8 > 0) {
+        if (byte < next_min || byte > next_max)
+          return FILE_TYPE_NEITHER;
+        remaining_utf8--;
+        next_min = 0x80;
+        next_max = 0xBF;
+      } else if (byte <= 0x7F) {
+        if (byte != '\t' && byte != '\n' && byte != '\v' &&
+            byte != '\f' && byte != '\r' &&
+            (byte < 0x20 || byte == 0x7F))
+          return FILE_TYPE_NEITHER;
+      } else if (byte >= 0xC2 && byte <= 0xDF) {
+        remaining_utf8 = 1;
+      } else if (byte == 0xE0) {
+        remaining_utf8 = 2;
+        next_min = 0xA0;
+      } else if ((byte >= 0xE1 && byte <= 0xEC) ||
+                 (byte >= 0xEE && byte <= 0xEF)) {
+        remaining_utf8 = 2;
+      } else if (byte == 0xED) {
+        remaining_utf8 = 2;
+        next_max = 0x9F;
+      } else if (byte == 0xF0) {
+        remaining_utf8 = 3;
+        next_min = 0x90;
+      } else if (byte >= 0xF1 && byte <= 0xF3) {
+        remaining_utf8 = 3;
+      } else if (byte == 0xF4) {
+        remaining_utf8 = 3;
+        next_max = 0x8F;
+      } else {
+        return FILE_TYPE_NEITHER;
+      }
+    }
+  }
+  return !ferror(file) && remaining_utf8 == 0 ? FILE_TYPE_TEXT : FILE_TYPE_NEITHER;
 }
 
+static int send_file(int sockfd, FILE *file) {
+  unsigned char buffer[BUFSIZE];
+  size_t bytes_read;
 
-int send_file(int sockfd, const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        fprintf(stderr, "Status: 1\nError opening file %s.\n", filename);
-        return -1;
-    }
+  if (fseek(file, 0, SEEK_SET) != 0)
+    return -1;
+  while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    if (send_all(sockfd, buffer, bytes_read) < 0)
+      return -1;
+  }
+  return ferror(file) ? -1 : 0;
+}
 
-    char buffer[BUFSIZE];
-    bzero(buffer, BUFSIZE);
-    size_t bytes_read = 0;
-    // Read the file chunk by chunk until the end of file
-    // outter loop: ensure buffer size is bounded (does not depend on file size)
-    while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
-        size_t total_sent = 0;
-        while (total_sent < bytes_read) {
-            ssize_t sent = send(sockfd, buffer + total_sent, bytes_read - total_sent, 0);
-            if (sent < 0) {
-                if (errno == EINTR)
-                    continue;
-                printf("Status: 1\nError sending data");
-                fclose(file);
-                return -1;
-            }
-            if (sent == 0) {
-                fprintf(stderr, "Status: 1\nERROR: connection closed while sending file\n");
-                fclose(file);
-                return -1;
-            }
-            total_sent += sent; // Advance the pointer by the amount actually sent
-        }
+static int receive_response(int sockfd, uint32_t *status,
+                            uint8_t **payload, uint32_t *payload_len,
+                            uint32_t max_payload) {
+  uint32_t net_status, net_payload_len;
+  int result = recv_all(sockfd, &net_status, sizeof(net_status));
+  if (result != 1)
+    return -1;
+  result = recv_all(sockfd, &net_payload_len, sizeof(net_payload_len));
+  if (result != 1)
+    return -1;
 
-        bzero(buffer, BUFSIZE); 
-    }
-
-    if (ferror(file)) {
-        perror("Status: 1\nError reading file");
-        fclose(file);
-        return -1;
-    }
-
-    fclose(file);
+  *status = ntohl(net_status);
+  *payload_len = ntohl(net_payload_len);
+  if (*payload_len > max_payload)
+    return -1;
+  *payload = NULL;
+  if (*payload_len == 0)
     return 0;
+
+  *payload = malloc(*payload_len);
+  if (*payload == NULL)
+    return -1;
+  result = recv_all(sockfd, *payload, *payload_len);
+  if (result != 1) {
+    free(*payload);
+    *payload = NULL;
+    return -1;
+  }
+  return 0;
+}
+
+static int report_server_error(const uint8_t *message, uint32_t length) {
+  fprintf(stderr, "Status: 1\nERROR: ");
+  if (length > 0)
+    fwrite(message, 1, length, stderr);
+  else
+    fprintf(stderr, "server could not process the file");
+  fputc('\n', stderr);
+  return 1;
+}
+
+static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
+  printf("Please enter filename: ");
+  fflush(stdout);
+
+  for (;;) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+    int max_fd = sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO;
+
+    // wait for input
+    int ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+    if (ready < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("Status: 1\nERROR waiting for filename or server response");
+      return -1;
+    }
+
+    // If the server responds before a filename is entered—or waiting or reading fails—it reports the issue 
+    // and returns -1. This lets the client notice server-side errors instead of waiting indefinitely for input.
+    if (FD_ISSET(sockfd, &readfds)) {
+      uint32_t status, payload_len;
+      uint8_t *payload = NULL;
+      if (receive_response(sockfd, &status, &payload, &payload_len, BUFSIZE) < 0) {
+        fprintf(stderr, "Status: 1\nERROR receiving server response while waiting for filename\n");
+      } else if (status == RESPONSE_STATUS_ERROR) {
+        report_server_error(payload, payload_len);
+      } else {
+        fprintf(stderr, "Status: 1\nERROR: unexpected server response while waiting for filename\n");
+      }
+      free(payload);
+      return -1;
+    }
+
+    if (FD_ISSET(STDIN_FILENO, &readfds)) {
+      if (fgets(filename, (int)capacity, stdin) == NULL) {
+        fprintf(stderr, "Status: 1\nERROR reading filename\n");
+        return -1;
+      }
+      filename[strcspn(filename, "\n")] = '\0';
+      return 0;
+    }
+  }
 }
 
 int main(int argc, char **argv) {
-    int sockfd,  n;
-    struct sockaddr_in serveraddr;
-    struct hostent *server;
+  struct client_config config;
+  struct addrinfo hints;
+  struct addrinfo *addresses = NULL;
+  struct addrinfo *address;
+  char service[16];
+  char filename[BUFSIZE];
+  FILE *file = NULL;
+  int sockfd = -1;
+  int exit_status = 1;
+  int64_t file_size;
+  uint32_t file_type, status, payload_len;
+  uint8_t *payload = NULL;
 
-    char buf[BUFSIZE];
+  // parse command-line options
+  if (process_args(argc, argv, &config) != 0)
+    return 1;
 
-    uint32_t fsize, ftype;
+  // Configure signal handling
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = SIG_IGN;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGPIPE, &action, NULL) < 0) {
+    perror("Status: 1\nERROR configuring signals");
+    return 1;
+  }
 
-    // check command line arguments
-    process_args(argc, argv);
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  snprintf(service, sizeof(service), "%d", config.portno);
 
-    // create the socket
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) 
-        error("Status: 1\nERROR opening socket");
+  // resolve the server address and connect to it.
+  int address_result = getaddrinfo(config.hostname, service, &hints, &addresses);
 
-    // get the server's DNS entry
-    // todo: change this when doing multithreading | not thread safe
-    server = gethostbyname(hostname);
-    if (server == NULL) {
-        fprintf(stderr,"Status: 1\nERROR, no such host as %s\n", hostname);
-        exit(1);
-    }
+  if (address_result != 0) {
+    fprintf(stderr, "Status: 1\nERROR resolving host: %s\n",
+            gai_strerror(address_result));
+    return 1;
+  }
 
-    // build the server's internet address
-    bzero((char *) &serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    bcopy((char *)server->h_addr, 
-	  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
-    serveraddr.sin_port = htons(portno);
-
-    // create a connection with the server
-    if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) 
-      error("Status: 1\nERROR connecting");
-
-    
-    while(1){
-    // get message line from the user
-    bzero(buf, BUFSIZE);
-    printf("Please enter filename: ");
-
-    if (fgets(buf, BUFSIZE, stdin) == NULL) {
-      fprintf(stderr, "Status: 1\nERROR reading filename\n");
+  for (address = addresses; address != NULL; address = address->ai_next) {
+    sockfd = socket(address->ai_family, address->ai_socktype,
+                    address->ai_protocol);
+    if (sockfd >= 0 &&
+        connect(sockfd, address->ai_addr, address->ai_addrlen) == 0)
+      break;
+    if (sockfd >= 0)
       close(sockfd);
-      return 1;
-    }
- 
-    // strip newline character for fopen() to work
-    buf[strcspn(buf, "\n")] = '\0';
+    sockfd = -1;
+  }
 
-    // compute and send file size.
-    fsize = get_file_size(buf); 
-    if (fsize <= 0) {
-      fprintf(stderr, "Status: 1\nERROR: unable to read a non-empty input file\n");
-      close(sockfd);
-      return 1;
-    }
-    /* send the file size to the server*/
-    uint32_t net_fsize = htonl(fsize);
-    if (send_all(sockfd, &net_fsize, sizeof(net_fsize)) < 0)
-      error("Status: 1\nERROR sending file size to socket");
+  freeaddrinfo(addresses);
+  if (sockfd < 0) {
+    perror("Status: 1\nERROR connecting to server");
+    return 1;
+  }
 
-    // compute and send file type.
-    ftype = (uint32_t)get_file_type(buf);
-    /* send the file type to the server*/
-    uint32_t net_ftype = htonl(ftype);
-    n = send(sockfd, &net_ftype, sizeof(net_ftype), 0);
-    if (n < 0) 
-      error("ERROR sending file type to socket");
-    
-    // now read file content into buf and send it to server.
-    n = send_file(sockfd, buf);
-    if (n < 0){
-      error("Status: 1\nERROR writing data to socket");
-    }
-    
-    uint32_t net_status, net_payload_len;
-    int result = recv_all(sockfd, &net_status, sizeof(net_status));
-    if (result != 1) {
-      fprintf(stderr, "Status: 1\nERROR receiving response status%s\n",
-              result == 0 ? ": server disconnected" : "");
-      close(sockfd);
-      return 1;
-    }
+  // read the server’s acceptance response, then ask for a filename using prompt_for_filename.
+  if (receive_response(sockfd, &status, &payload, &payload_len, BUFSIZE) < 0) {
+    fprintf(stderr, "Status: 1\nERROR receiving connection response\n");
+    goto cleanup;
+  }
 
-    uint32_t status = ntohl(net_status);
-    result = recv_all(sockfd, &net_payload_len, sizeof(net_payload_len));
-    if (result != 1) {
-      fprintf(stderr, "Status: 1\nERROR receiving response length%s\n",
-              result == 0 ? ": server disconnected" : "");
-      close(sockfd);
-      return 1;
-    }
+  if (status == RESPONSE_STATUS_ERROR) {
+    exit_status = report_server_error(payload, payload_len);
+    goto cleanup;
+  }
+  free(payload);
+  payload = NULL;
+  if (status != RESPONSE_STATUS_ACCEPTED || payload_len != 0) {
+    fprintf(stderr, "Status: 1\nERROR: invalid connection response\n");
+    goto cleanup;
+  }
 
-    uint32_t payload_len = ntohl(net_payload_len);
-    if (status > RESPONSE_STATUS_TEXT ||
-        (status == RESPONSE_STATUS_ERROR && payload_len != 0) ||
-        (status == RESPONSE_STATUS_URL && payload_len > MAX_PAYLOAD_SIZE) ||
-        (status == RESPONSE_STATUS_TEXT &&
-         payload_len > MAX_TEXT_RESPONSE_SIZE)) {
-      fprintf(stderr, "Status: 1\nERROR: invalid server response\n");
-      close(sockfd);
-      return 1;
-    }
-    if (status == RESPONSE_STATUS_ERROR) {
-      printf("Status: 1\n no URL returned.\n");
-      close(sockfd);
-      return 1;
-    }
+  // Opens and checks the file, determines whether it’s text or an image, and sends the file size and type.
+  // Waits for the server’s “ready” response, sends the file, then receives and displays either the text contents or a QR-code payload.
+  // On success or failure, frees the response buffer, closes the file and socket, and returns an exit status.
+  if (prompt_for_filename(sockfd, filename, sizeof(filename)) < 0)
+    goto cleanup;
+  
+  file = fopen(filename, "rb");
+  if (file == NULL) {
+    perror("Status: 1\nERROR opening file");
+    goto cleanup;
+  }
+  
+  if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0) {
+    fprintf(stderr, "Status: 1\nERROR: unable to read a non-empty input file\n");
+    goto cleanup;
+  }
+  
+  if ((uint64_t)file_size > MAX_FILE_SZ) {
+    fprintf(stderr, "Status: 1\nERROR: file is too large for the server (maximum %u bytes)\n",
+            MAX_FILE_SZ);
+    goto cleanup;
+  }
+  
+  file_type = (uint32_t)get_file_type(file);
+  uint32_t net_value = htonl((uint32_t)file_size);
+  if (send_all(sockfd, &net_value, sizeof(net_value)) < 0) {
+    perror("Status: 1\nERROR sending file size");
+    goto cleanup;
+  }
+  
+  net_value = htonl(file_type);
+  if (send_all(sockfd, &net_value, sizeof(net_value)) < 0) {
+    perror("Status: 1\nERROR sending file type");
+    goto cleanup;
+  }
 
-    uint8_t *payload = NULL;
-    if (payload_len > 0) {
-      payload = malloc(payload_len);
-      if (payload == NULL) {
-        perror("Status: 1\nERROR allocating response buffer");
-        close(sockfd);
-        return 1;
-      }
-    }
+  if (receive_response(sockfd, &status, &payload, &payload_len, BUFSIZE) < 0) {
+    fprintf(stderr, "Status: 1\nERROR receiving upload acknowledgment\n");
+    goto cleanup;
+  }
+  if (status == RESPONSE_STATUS_ERROR) {
+    exit_status = report_server_error(payload, payload_len);
+    goto cleanup;
+  }
+  free(payload);
+  payload = NULL;
+  if (status != RESPONSE_STATUS_READY || payload_len != 0) {
+    fprintf(stderr, "Status: 1\nERROR: invalid upload acknowledgment\n");
+    goto cleanup;
+  }
 
-    result = recv_all(sockfd, payload, payload_len);
-    if (result != 1) {
-      fprintf(stderr, "Status: 1\nERROR receiving QR payload%s\n",
-              result == 0 ? ": server disconnected" : "");
-      free(payload);
-      close(sockfd);
-      return 1;
-    }
+  if (send_file(sockfd, file) < 0) {
+    perror("Status: 1\nERROR sending file data");
+    goto cleanup;
+  }
+  if (receive_response(sockfd, &status, &payload, &payload_len,
+                       MAX_FILE_SZ) < 0) {
+    fprintf(stderr, "Status: 1\nERROR receiving server response\n");
+    goto cleanup;
+  }
+  if (status == RESPONSE_STATUS_ERROR) {
+    exit_status = report_server_error(payload, payload_len);
+    goto cleanup;
+  }
+  if (status == RESPONSE_STATUS_TEXT) {
+    printf("Status: 0\nText file contents:\n");
+  } else if (status == RESPONSE_STATUS_ACCEPTED && payload_len <= MAX_URL_SZ) {
+    printf("Status: 0\nURL (%u bytes): ", payload_len);
+  } else {
+    fprintf(stderr, "Status: 1\nERROR: invalid server response\n");
+    goto cleanup;
+  }
+  if (payload_len > 0)
+    fwrite(payload, 1, payload_len, stdout);
+  if (payload_len == 0 || payload[payload_len - 1] != '\n')
+    fputc('\n', stdout);
+  exit_status = 0;
 
-    if (status == RESPONSE_STATUS_TEXT) {
-      printf("Status: 0\nText file contents:\n");
-      if (fwrite(payload, 1, payload_len, stdout) != payload_len) {
-        perror("Status: 1\nERROR printing text response");
-        free(payload);
-        close(sockfd);
-        return 1;
-      }
-      if (payload_len == 0 || payload[payload_len - 1] != '\n')
-        putchar('\n');
-    } else {
-      printf("Status: 0\nURL (%u bytes): ", payload_len);
-      if (fwrite(payload, 1, payload_len, stdout) != payload_len) {
-        perror("Status: 1\nERROR printing QR payload");
-        free(payload);
-        close(sockfd);
-        return 1;
-      }
-      putchar('\n');
-    }
-    free(payload);
-    }
+cleanup:
+  free(payload);
+  if (file != NULL)
+    fclose(file);
+  if (sockfd >= 0)
     close(sockfd);
-    
-    return 0;
+  return exit_status;
 }
