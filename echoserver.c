@@ -1,7 +1,7 @@
-  /*
-  * echoserver.c - A simple connection-based echo server
-  * usage: echoserver <port>
-  */
+/*
+ * echoserver.c - A simple connection-based echo server
+ * usage: echoserver <port>
+ */
 
 #include <stdio.h>
 #include <errno.h>
@@ -21,33 +21,32 @@
 #include <sys/time.h>
 #include "quirc-master/lib/quirc.h"
 
-  #define STB_IMAGE_IMPLEMENTATION
-  #include "stb_image.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
-#define BUFSIZE 1024
 #define QSIZE 5
 
-  #define FILE_TYPE_NEITHER 0
-  #define FILE_TYPE_IMAGE 1
-  #define FILE_TYPE_TEXT 2
+#define FILE_TYPE_IMAGE 1
+#define FILE_TYPE_TEXT 2
 
-#define RESPONSE_STATUS_ACCEPTED 0
+#define RESPONSE_STATUS_SUCCESS 0
 #define RESPONSE_STATUS_ERROR 1
-#define RESPONSE_STATUS_TEXT 2
-#define RESPONSE_STATUS_READY 3
+#define RESPONSE_STATUS_TIMEOUT 2
+#define RESPONSE_STATUS_RATELIMIT 3
 
-  // default values for optional arguments.
-  #define DEFAULT_PORT 2012
-  #define DEFAULT_RATE_REQUESTS 3
-  #define DEFAULT_RATE_SECONDS 60
-  #define DEFAULT_MAX_USERS 3
-  #define DEFAULT_TIMEOUT_SECONDS 80
 
-  // max values to protect server
-  #define MAX_FILE_SZ 20*1024*1024 // max for qr file
-  #define MAX_URL_SZ  200 // in characters
+// default values for optional arguments.
+#define DEFAULT_PORT 2012
+#define DEFAULT_RATE_REQUESTS 3
+#define DEFAULT_RATE_SECONDS 60
+#define DEFAULT_MAX_USERS 3
+#define DEFAULT_TIMEOUT_SECONDS 80
 
-  struct client_context {
+// max values to protect server
+#define MAX_FILE_SZ 20*1024*1024 // max for qr file
+#define MAX_URL_SZ  200 // in characters
+
+struct client_context {
   int connfd;
   struct sockaddr_in clientaddr;
 };
@@ -59,8 +58,8 @@ struct rate_entry {
 };
 
 // initialize values to default
-static   int portno = DEFAULT_PORT;
-  static int rate_requests = DEFAULT_RATE_REQUESTS;
+static int portno = DEFAULT_PORT;
+static int rate_requests = DEFAULT_RATE_REQUESTS;
 static int rate_seconds = DEFAULT_RATE_SECONDS;
 static int max_users = DEFAULT_MAX_USERS;
 static int timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
@@ -78,28 +77,24 @@ void error(char *msg) {
   perror(msg);
   exit(1);
 }
-  //wrapper for perror
-  void error(char *msg) {
-    perror(msg);
-    exit(1);
-  }
 
-  static int send_all(int fd, const void *buffer, size_t length) {
-    size_t sent = 0;
-    while (sent < length) {
-      ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
-      if (result < 0) {
-        if (errno == EINTR)
-          continue;
-        return -1;
-      }
-      if (result == 0)
-        return -1;
-      sent += (size_t)result;
+static int send_all(int fd, const void *buffer, size_t length) {
+  size_t sent = 0;
+  while (sent < length) {
+    ssize_t result = send(fd, (const char *)buffer + sent, length - sent, 0);
+    if (result < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
     }
-    return 0;
+    if (result == 0)
+      return -1;
+    sent += (size_t)result;
   }
+  return 0;
+}
 
+// Returns 1 for EOF before receiving data, 0 on success, and -1 on errors or truncated input.
 static int recv_all(int fd, void *buffer, size_t length) {
   size_t received = 0;
   while (received < length) {
@@ -107,13 +102,17 @@ static int recv_all(int fd, void *buffer, size_t length) {
     if (result < 0) {
       if (errno == EINTR)
         continue;
-      return 1;
+      return -1;
     }
-    if (result == 0)
-      return 0;
+    if (result == 0) {
+      if (received == 0)
+        return 1;
+      errno = ECONNRESET;
+      return -1;
+    }
     received += (size_t)result;
   }
-  return 1;
+  return 0;
 }
 
 static int send_response(int fd, uint32_t status, const uint8_t *payload, uint32_t payload_len) {
@@ -125,11 +124,6 @@ static int send_response(int fd, uint32_t status, const uint8_t *payload, uint32
   if (payload_len > 0 && send_all(fd, payload, payload_len) < 0)
     return -1;
   return 0;
-}
-
-static int send_error_response(int fd, const char *message) {
-  return send_response(fd, RESPONSE_STATUS_ERROR, (const uint8_t *)message,
-                       (uint32_t)strlen(message));
 }
 
 /* 
@@ -200,43 +194,46 @@ static int parse_positive_int(const char *text, int *value) {
   return 0;
 }
 
-// ai log here
 static int process_args(int argc, char **argv) {
   int seen_port = 0, seen_rate = 0, seen_users = 0, seen_timeout = 0;
   int i = 1;
-
+  int value;
   while (i < argc) {
-    int value;
+    value = 0;
     if (strcmp(argv[i], "PORT") == 0) {
       // checks if port already seen, port not given a value, or given value is outside valid range
-      if (seen_port++ || i + 1 >= argc || value < 2000 || value > 3000) {
+      if (seen_port++ || i + 1 >= argc || value < 2000 || value > 3000 || parse_positive_int(argv[i + 1], &value) < 0) {
         fprintf(stderr, "Usage: %s [PORT 2000-3000] [RATE requests seconds] " "[MAX USERS users] [TIME OUT seconds]\n", argv[0]);
         return -1;
       }
       portno = value;
       i += 2;
-    } else if (strcmp(argv[i], "RATE") == 0) {
+    } 
+    else if (strcmp(argv[i], "RATE") == 0) {
       // checks if rate already seen, rate not given enough values, or either given value is invalid 
       if (seen_rate++ || i + 2 >= argc || parse_positive_int(argv[i + 1], &rate_requests) < 0 || parse_positive_int(argv[i + 2], &rate_seconds) < 0) {
         fprintf(stderr, "Invalid or duplicate RATE option.\n");
         return -1;
       }
       i += 3;
-    } else if (strcmp(argv[i], "MAXUSERS") == 0) {
+    } 
+    else if (strcmp(argv[i], "MAX_USERS") == 0) {
       // checks if max users already seen, max users not given a value, or given value is invalid 
-      if (seen_users++ || i + 1 >= argc || parse_positive_int(argv[i + 2], &max_users) < 0) {
+      if (seen_users++ || i + 1 >= argc || parse_positive_int(argv[i + 1], &max_users) < 0) {
         fprintf(stderr, "Invalid or duplicate MAX USERS option.\n");
         return -1;
       }
-      i += 3;
-    } else if (strcmp(argv[i], "TIMEOUT") == 0) {
-      // checks if time already seen, time not given a value, or given value is invalid 
-      if (seen_timeout++ || i + 1 >= argc || parse_positive_int(argv[i + 2], &timeout_seconds) < 0) {
-        fprintf(stderr, "Invalid or duplicate TIME OUT option.\n");
-        return -1;
+      i += 2;
+    } 
+    else if (strcmp(argv[i], "TIME_OUT") == 0) {
+        // checks if time already seen, time not given a value, or given value is invalid 
+        if (seen_timeout++ || i + 1 >= argc || parse_positive_int(argv[i + 1], &timeout_seconds) < 0) {
+          fprintf(stderr, "Invalid or duplicate TIME OUT option.\n");
+          return -1;
       }
-      i += 3;
-    } else {
+      i += 2;
+    } 
+    else {
       fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]);
       return -1;
     }
@@ -244,7 +241,7 @@ static int process_args(int argc, char **argv) {
   return 0;
 }
 
-static int is_timeout_error(int result) {
+static int is_timeout(int result) {
   return result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
@@ -327,32 +324,38 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
   
   // read file size from the client
   int result = recv_all(connfd, &fsize, sizeof(fsize));
-  if (result != 1) {
-    int timed_out = is_timeout_error(result);
+  if (result == 1)
+    return 0;
+  if (result != 0) {
+    int timed_out = is_timeout(result);
     if (timed_out) {
-      fprintf(stderr, "Status: 1\nERROR: connection timed out after %d seconds\n",
+      fprintf(stderr, "Status: 2\nConnection timed out after %d seconds\n",
               timeout_seconds);
-      if (send_error_response(connfd, "Connection timed out.") < 0)
+      if (send_response(connfd, RESPONSE_STATUS_TIMEOUT,
+                        (const uint8_t *)"Status: 2\nConnection timed out.",
+                        sizeof("Status: 2\nConnection timed out.") - 1) < 0)
         perror("Status: 1\nERROR sending timeout response");
+    } else {
+      fprintf(stderr, "Status: 1\nERROR reading fsize from socket\n");
     }
-    fprintf(stderr, "Status: 1\nERROR reading fsize from socket%s\n",
-            result == 0 ? ": client disconnected" : "");
     return 0;
   }
   fsize = ntohl(fsize);
 
   // read file type from client
   result = recv_all(connfd, &ftype, sizeof(ftype));
-  if (result != 1) {
-    int timed_out = is_timeout_error(result);
+  if (result != 0) {
+    int timed_out = is_timeout(result);
     if (timed_out) {
-      fprintf(stderr, "Status: 1\nERROR: connection timed out after %d seconds\n",
+      fprintf(stderr, "Status: 2\nConnection timed out after %d seconds\n",
               timeout_seconds);
-      if (send_error_response(connfd, "Connection timed out.") < 0)
+      if (send_response(connfd, RESPONSE_STATUS_TIMEOUT,
+                        (const uint8_t *)"Status: 2\nConnection timed out.",
+                        sizeof("Status: 2\nConnection timed out.") - 1) < 0)
         perror("Status: 1\nERROR sending timeout response");
+    } else {
+      fprintf(stderr, "Status: 1\nERROR reading file type from socket\n");
     }
-    fprintf(stderr, "Status: 1\nERROR reading file type from socket%s\n",
-            result == 0 ? ": client disconnected" : "");
     return 0;
   }
   ftype = ntohl(ftype);
@@ -361,13 +364,15 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
   int rate_result = rate_allows_request(clientaddr.sin_addr.s_addr);
   if (rate_result == 0) {
     char message[160];
-    snprintf(message, sizeof(message),
-             "Rate limit exceeded: maximum %d requests per %d seconds.", rate_requests, rate_seconds);
+    snprintf(message, sizeof(message), 
+      "Rate limit exceeded: maximum %d requests per %d seconds.", rate_requests, rate_seconds);
     fprintf(stderr, "Status: 3\nERROR: %s\n", message);
-    return send_error_response(connfd, message) == 0;
+    return send_response(connfd, RESPONSE_STATUS_RATELIMIT, "Status: 3\nRate limit exceeded.", 
+      sizeof("Status: 3\nRate limit exceeded.")) == 0; 
   }
   if (rate_result < 0) {
-    send_error_response(connfd, "Server could not enforce the rate limit.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nERROR: Server could not enforce the rate limit.", 
+      sizeof("Status: 1\nERROR: Server could not enforce the rate limit."));
     return 0;
   }
 
@@ -375,49 +380,49 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
   if (fsize > MAX_FILE_SZ) {
     fprintf(stderr, "Status: 1\nERROR: file too large: %u bytes (maximum %u)\n",
             fsize, (unsigned int)MAX_FILE_SZ);
-    send_error_response(connfd, "File is too large for the server.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nFile is too large for the server.", 
+      sizeof("Status: 1\nFile is too large for the server."));
     return 0;
   }
 
   if (fsize == 0 || (ftype != FILE_TYPE_IMAGE && ftype != FILE_TYPE_TEXT)) {
     fprintf(stderr, "Status: 1\nERROR: invalid or unsupported file\n");
-    send_error_response(connfd, "File is empty or is not a supported image or text file.");
-    return 0;
-  }
-
-  // Tells the client it is ready, allocates a buffer, and receives the file data.
-  if (send_response(connfd, RESPONSE_STATUS_READY, NULL, 0) < 0) {
-    perror("Status: 1\nERROR acknowledging upload");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nFile is empty or is not a supported image or text file.",
+    sizeof("Status: 1\nFile is empty or is not a supported image or text file."));
     return 0;
   }
 
   uint8_t *buffer = malloc((size_t)fsize);
   if (buffer == NULL) {
     perror("Status: 1\nFailed to allocate image buffer");
-    send_error_response(connfd, "Server could not allocate memory for the upload.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not allocate memory for the upload.", 
+    sizeof("Status: 1\nServer could not allocate memory for the upload."));
     return 0;
   }
 
   // times user out after extended inactivity
   result = recv_all(connfd, buffer, (size_t)fsize);
-  if (result != 1) {
-    int timed_out = is_timeout_error(result);
+  if (result != 0) {
+    int timed_out = is_timeout(result);
     if (timed_out) {
-      fprintf(stderr, "Status: 1\nERROR: connection timed out after %d seconds\n",
+      fprintf(stderr, "Status: 2\nConnection timed out after %d seconds\n",
               timeout_seconds);
-      if (send_error_response(connfd, "Connection timed out.") < 0)
+      if (send_response(connfd, RESPONSE_STATUS_TIMEOUT,
+                        (const uint8_t *)"Status: 2\nConnection timed out.",
+                        sizeof("Status: 2\nConnection timed out.") - 1) < 0)
         perror("Status: 1\nERROR sending timeout response");
-    } else if (result == 0)
-      fprintf(stderr, "Status: 1\nERROR: client disconnected before sending all %u bytes\n", fsize);
-    else
+    } else if (result == 1) {
+      fprintf(stderr, "Status: 1\nERROR: client disconnected before the complete file was received\n");
+    } else
       perror("Status: 1\nERROR receiving binary file data");
     free(buffer);
-    if (!timed_out && send_error_response(connfd, "Server did not receive the complete file.") < 0)
+    if (!timed_out && send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer did not receive the complete file.",
+      sizeof("Status: 1\nServer did not receive the complete file.")) < 0)
       perror("Status: 1\nERROR sending incomplete-file response");
     return 0;
   }
 
-    printf("Status: 0\nSUCCESS: File completely received! Total bytes: %u\n", fsize);
+  printf("Status: 0\nSUCCESS: File completely received! Total bytes: %u\n", fsize);
 
   /*
     If the file text, validates it as UTF-8, prints it, and sends the text back.
@@ -431,7 +436,8 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     if (!is_valid_text(buffer, fsize)) {
       fprintf(stderr, "Status: 1\nERROR: received text file is not valid UTF-8 text\n");
       free(buffer);
-      send_error_response(connfd, "File is not valid UTF-8 text.");
+      send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nFile is not valid UTF-8 text.",
+      sizeof("Status: 1\nFile is not valid UTF-8 text."));
       return 0;
     }
 
@@ -453,7 +459,7 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     }
 
     // sends content to client
-    int response_result = send_response(connfd, RESPONSE_STATUS_TEXT, buffer, fsize);
+    int response_result = send_response(connfd, RESPONSE_STATUS_SUCCESS, buffer, fsize);
     free(buffer);
     if (response_result < 0)
       perror("Status: 1\nERROR sending response to client");
@@ -468,7 +474,8 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
   if (mutex_result != 0) {
     fprintf(stderr, "Status: 1\nERROR locking image decoder mutex: %s\n", strerror(mutex_result));
     free(buffer);
-    send_error_response(connfd, "Server could not process the image.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not process the image.",
+    sizeof("Status: 1\nServer could not process the image."));
     return 0;
   }
   uint8_t *pixels = stbi_load_from_memory(buffer, fsize, &w, &h, &channels, 1);
@@ -480,21 +487,24 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     if (pixels)
       stbi_image_free(pixels);
     free(buffer);
-    send_error_response(connfd, "Server could not process the image.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not process the image.",
+    sizeof("Status: 1\nServer could not process the image."));
     return 0;
   }
   free(buffer);
 
   // send error if decoding fails
   if(!pixels){
-    send_error_response(connfd, "File is not a valid image containing a QR code.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nFile is not a valid image containing a QR code.",
+    sizeof("Status: 1\nFile is not a valid image containing a QR code."));
     return 0;
   }
   struct quirc *qr = quirc_new();
   if(!qr){
     perror("Status: 1\nFailed to allocate memory");
     stbi_image_free(pixels);
-    send_error_response(connfd, "Server could not allocate memory to decode the QR code.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not allocate memory to decode the QR code.",
+    sizeof("Status: 1\nServer could not allocate memory to decode the QR code."));
     return 0;
   }
 
@@ -503,7 +513,8 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     perror("Status: 1\nFailed to allocate memory");
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_error_response(connfd, "Server could not decode the QR image.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not decode the QR image.",
+    sizeof("Status: 1\nServer could not decode the QR image."));
     return 0;
   }
 
@@ -514,7 +525,8 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     fprintf(stderr, "Status: 1\nFailed to obtain QR image buffer\n");
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_error_response(connfd, "Server could not decode the QR image.");
+    send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nServer could not decode the QR image.",
+     sizeof("Status: 1\nServer could not decode the QR image."));
     return 0;
   }
   
@@ -522,8 +534,8 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
   stbi_image_free(pixels);
   quirc_end(qr);
 
-    int num_codes = quirc_count(qr);
-    printf("Found %d QR codes\n", num_codes);
+  int num_codes = quirc_count(qr);
+  printf("Found %d QR codes\n", num_codes);
 
   // create url
   uint8_t url[MAX_URL_SZ];
@@ -534,7 +546,7 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
     struct quirc_data data;
     quirc_decode_error_t err;
 
-      quirc_extract(qr, i, &code);
+    quirc_extract(qr, i, &code);
 
     // A QR pattern was found, but its contents couldn’t be decoded. 
     err = quirc_decode(&code, &data);
@@ -557,11 +569,12 @@ static int process_client_request(int connfd, struct sockaddr_in clientaddr) {
 
   int response_result;
   if (have_url) {
-    response_result = send_response(connfd, RESPONSE_STATUS_ACCEPTED, url, url_len);
-  } else {
+    response_result = send_response(connfd, RESPONSE_STATUS_SUCCESS, url, url_len);
+  } 
+  else {
     // No QR code produced a usable payload
-    response_result = send_error_response(
-        connfd, "Image does not contain a valid QR code with a supported payload.");
+    response_result = send_response(connfd, RESPONSE_STATUS_ERROR, "Status: 1\nImage does not contain a valid QR code with a supported payload.",
+      sizeof("Status: 1\nImage does not contain a valid QR code with a supported payload."));
   }
   if (response_result < 0)
     perror("Status: 1\nERROR sending response to client");
@@ -595,8 +608,9 @@ static void release_user_slot(void) {
   It doesn’t start a client-handling thread or take up an active-user slot.
 */
 static void reject_busy_connection(int connfd) {
-  if (send_error_response(connfd,
-                          "Server is busy. Please try again later.") < 0)
+  static const char message[] = "Status: 1\nServer is busy. Please try again later.";
+  if (send_response(connfd, RESPONSE_STATUS_ERROR, (const uint8_t *)message,
+                    (uint32_t)(sizeof(message) - 1)) < 0)
     perror("Status: 1\nERROR sending busy response");
 
   if (shutdown(connfd, SHUT_WR) < 0 && errno != ENOTCONN)
@@ -618,8 +632,8 @@ static void *client_thread(void *arg) {
   struct sockaddr_in clientaddr = context->clientaddr;
   free(context);
 
-  if (send_response(connfd, RESPONSE_STATUS_ACCEPTED, NULL, 0) < 0) {
-    perror("ERROR sending connection acceptance");
+  if (send_response(connfd, RESPONSE_STATUS_SUCCESS, NULL, 0) < 0) {
+    perror("Status: 1\nERROR sending connection-ready response");
     close(connfd);
     release_user_slot();
     return NULL;
@@ -668,7 +682,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-
   // Create a TCP socket
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
   if (listenfd < 0)
@@ -680,20 +693,20 @@ int main(int argc, char **argv) {
                  (const void *)&optval, sizeof(int)) < 0)
     error("Status: 1\nERROR setting socket options");
 
-    // build the server's internet address 
-    bzero((char *) &serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET; // we are using the Internet
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); // accept reqs to any IP addr
-    serveraddr.sin_port = htons((unsigned short)portno); // port to listen on
+  // build the server's internet address 
+  bzero((char *) &serveraddr, sizeof(serveraddr));
+  serveraddr.sin_family = AF_INET; // we are using the Internet
+  serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); // accept reqs to any IP addr
+  serveraddr.sin_port = htons((unsigned short)portno); // port to listen on
 
-    // bind the listening socket to a port
-    if (bind(listenfd, (struct sockaddr *) &serveraddr,
-      sizeof(serveraddr)) < 0)
-      error("Status: 1\nERROR on binding");
+  // bind the listening socket to a port
+  if (bind(listenfd, (struct sockaddr *) &serveraddr,
+	   sizeof(serveraddr)) < 0)
+    error("Status: 1\nERROR on binding");
 
-    // make it a listening socket ready to accept connection requests
-    if (listen(listenfd, QSIZE) < 0) // allow n requests to queue up
-      error("Status: 1\nERROR on listen");
+  // make it a listening socket ready to accept connection requests
+  if (listen(listenfd, QSIZE) < 0) // allow n requests to queue up
+    error("Status: 1\nERROR on listen");
 
   // wait for a connection request, echo input line, then close connection.
   while (1) {
@@ -710,7 +723,7 @@ int main(int argc, char **argv) {
     // set timeout for socket
     struct timeval timeout = {timeout_seconds, 0};
     if (setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-      perror("Status: 1\nERROR configuring connection timeout");
+      perror("Status: 2\nTimeout");
       close(connfd);
       continue;
     }    
