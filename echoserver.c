@@ -241,7 +241,7 @@ static void fail_recv(int fd, const char *ip, int result, const char *what) {
     log_event(ip, "client_eof", "client closed while reading %s", what);
   } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
     log_event(ip, "timeout", "no data for %d s while reading %s", timeout_seconds, what);
-    if (send_message(fd, RESPONSE_STATUS_TIMEOUT, "Connection timed out.") < 0)
+    if (send_message(fd, RESPONSE_STATUS_TIMEOUT, "\nConnection timed out.") < 0)
       log_event(ip, "send_failed", "could not send timeout message: %m");
   } else if (errno == ECONNRESET) {
     log_event(ip, "client_reset", "connection reset or truncated while reading %s", what);

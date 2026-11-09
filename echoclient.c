@@ -21,121 +21,24 @@
 // max values to protect server
 #define MAX_FILE_SZ (20U * 1024U * 1024U)
 #define MAX_URL_SZ 200
+
 #define FILE_TYPE_NEITHER 0
 #define FILE_TYPE_IMAGE 1
 #define FILE_TYPE_TEXT 2
 
-#define RESPONSE_STATUS_ACCEPTED 0
-#define RESPONSE_STATUS_ERROR    1
-#define RESPONSE_STATUS_TIMEOUT  2
-#define RESPONSE_STATUS_READY    3
+#define RESPONSE_STATUS_SUCCESS 0
+#define RESPONSE_STATUS_ERROR 1
+#define RESPONSE_STATUS_TIMEOUT 2
+#define RESPONSE_STATUS_RATELIMIT 3
 
 #define RESULT_OK 0     //all nominal
 #define RESULT_RETRY 1  //file failed, connection works
 #define RESULT_FATAL -1 //connection is broken
 
-static int send_all(int fd, const void *buffer, size_t length);
-static int recv_all(int fd, void *buffer, size_t length);
-static int get_file_type(FILE *file);
-static int send_file(int sockfd, FILE *file);
-static int receive_response(int sockfd, uint32_t *status,
-                            uint8_t **payload, uint32_t *payload_len,
-                            uint32_t max_payload);
-static int report_server_error(const uint8_t *message, uint32_t length);
-
-
 struct client_config {
   char hostname[256];
   int portno;
 };
-
-static int send_one_file(int sockfd, const char *filename) {
-  FILE *file = fopen(filename, "rb");
-  uint8_t *payload = NULL;
-  uint32_t status, payload_len;
-  int rc = RESULT_FATAL;
-
-  if (file == NULL) {
-    perror("Status: 1\nERROR opening file");
-    return RESULT_RETRY;
-  }
-
-  long file_size;
-  if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0) {
-    fprintf(stderr, "Status: 1\nERROR: unable to read a non-empty input file\n");
-    rc = RESULT_RETRY;
-    goto done;
-  }
-  if ((uint64_t)file_size > MAX_FILE_SZ) {
-    fprintf(stderr, "Status: 1\nERROR: file too large (maximum %u bytes)\n", MAX_FILE_SZ);
-    rc = RESULT_RETRY;
-    goto done;
-  }
-
-  uint32_t file_type = (uint32_t)get_file_type(file);
-  uint32_t net_size = htonl((uint32_t)file_size);
-  uint32_t net_type = htonl(file_type);
-  if (send_all(sockfd, &net_size, sizeof(net_size)) < 0 ||
-      send_all(sockfd, &net_type, sizeof(net_type)) < 0) {
-    perror("Status: 1\nERROR sending header");
-    goto done;
-  }
-
-  // header is followed directly by the file bytes
-  if (send_file(sockfd, file) < 0) {
-    perror("Status: 1\nERROR sending file data");
-    goto done;
-  }
-
-  if (receive_response(sockfd, &status, &payload, &payload_len, MAX_FILE_SZ) < 0) {
-    fprintf(stderr, "Status: 1\nERROR receiving server response\n");
-    goto done;
-  }
-
-  if (status == RESPONSE_STATUS_TIMEOUT) {
-    fprintf(stderr, "Status: 2\nTIMEOUT: ");
-    if (payload_len > 0) fwrite(payload, 1, payload_len, stderr);
-    fputc('\n', stderr);
-    goto done;                              // server closes: fatal
-  }
-  if (status == RESPONSE_STATUS_ERROR) {
-    fprintf(stderr, "Status: 3\nRATE LIMIT: ");
-    if (payload_len > 0) fwrite(payload, 1, payload_len, stderr);
-    fputc('\n', stderr);
-    rc = RESULT_RETRY;
-    goto done;
-  }
-  if (status == RESPONSE_STATUS_ERROR) {
-    report_server_error(payload, payload_len);
-    rc = RESULT_RETRY;
-    goto done;
-  }
-  if (status != RESPONSE_STATUS_ACCEPTED) {
-    fprintf(stderr, "Status: 1\nERROR: invalid server response\n");
-    goto done;
-  }
-
-  if (file_type == FILE_TYPE_TEXT) {
-    printf("Status: 0\nText file contents:\n");
-  } else if (payload_len <= MAX_URL_SZ) {
-    printf("Status: 0\nURL (%u bytes): ", payload_len);
-  } else {
-    fprintf(stderr, "Status: 1\nERROR: URL longer than expected\n");
-    goto done;
-  }
-
-  if (payload_len > 0)
-    fwrite(payload, 1, payload_len, stdout);
-  if (payload_len == 0 || payload[payload_len - 1] != '\n')
-    fputc('\n', stdout);
-  rc = RESULT_OK;
-
-done:
-  free(payload);
-  fclose(file);
-  return rc;
-}
-
 
 // process user input
 static int process_args(int argc, char **argv, struct client_config *cfg) {
@@ -283,9 +186,7 @@ static int send_file(int sockfd, FILE *file) {
   return ferror(file) ? -1 : 0;
 }
 
-static int receive_response(int sockfd, uint32_t *status,
-                            uint8_t **payload, uint32_t *payload_len,
-                            uint32_t max_payload) {
+static int receive_response(int sockfd, uint32_t *status, uint8_t **payload, uint32_t *payload_len, uint32_t max_payload) {
   uint32_t net_status, net_payload_len;
   int result = recv_all(sockfd, &net_status, sizeof(net_status));
   if (result != 1)
@@ -324,6 +225,116 @@ static int report_server_error(const uint8_t *message, uint32_t length) {
   return 1;
 }
 
+static void report_server_timeout(const uint8_t *message, uint32_t length) {
+  fprintf(stderr, "Status: 2\n");
+  if (length > 0) {
+    if (message[0] == '\n') {
+      message++;
+      length--;
+    }
+    fwrite(message, 1, length, stderr);
+  } else {
+    fprintf(stderr, "Connection timed out.");
+  }
+  if (length == 0 || message[length - 1] != '\n')
+    fputc('\n', stderr);
+}
+
+static void report_server_ratelimit(const uint8_t *message, uint32_t length) {
+  fprintf(stderr, "Status: 3\n");
+  if (length > 0)
+    fwrite(message, 1, length, stderr);
+  else
+    fprintf(stderr, "Rate limit exceeded.");
+  if (length == 0 || message[length - 1] != '\n')
+    fputc('\n', stderr);
+}
+
+static int send_one_file(int sockfd, const char *filename) {
+  FILE *file = fopen(filename, "rb");
+  uint8_t *payload = NULL;
+  uint32_t status, payload_len;
+  int rc = RESULT_FATAL;
+
+  if (file == NULL) {
+    perror("Status: 1\nERROR opening file");
+    return RESULT_RETRY;
+  }
+
+  long file_size;
+  if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0) {
+    fprintf(stderr, "Status: 1\nERROR: unable to read a non-empty input file\n");
+    rc = RESULT_RETRY;
+    goto done;
+  }
+  if ((uint64_t)file_size > MAX_FILE_SZ) {
+    fprintf(stderr, "Status: 1\nERROR: file too large (maximum %u bytes)\n", MAX_FILE_SZ);
+    rc = RESULT_RETRY;
+    goto done;
+  }
+
+  uint32_t file_type = (uint32_t)get_file_type(file);
+  uint32_t net_size = htonl((uint32_t)file_size);
+  uint32_t net_type = htonl(file_type);
+  if (send_all(sockfd, &net_size, sizeof(net_size)) < 0 ||
+      send_all(sockfd, &net_type, sizeof(net_type)) < 0) {
+    perror("Status: 1\nERROR sending header");
+    goto done;
+  }
+
+  // header is followed directly by the file bytes
+  if (send_file(sockfd, file) < 0) {
+    perror("Status: 1\nERROR sending file data");
+    goto done;
+  }
+  if (receive_response(sockfd, &status, &payload, &payload_len, MAX_FILE_SZ) < 0) {
+    fprintf(stderr, "Status: 1\nERROR receiving server response\n");
+    goto done;
+  }
+  if (status == RESPONSE_STATUS_TIMEOUT) {
+    report_server_timeout(payload, payload_len);
+    rc = RESULT_FATAL;
+    goto done;
+  }
+  
+  if (status == RESPONSE_STATUS_RATELIMIT) {
+    report_server_ratelimit(payload, payload_len);
+    rc = RESULT_RETRY;
+    goto done;
+  }
+  
+  if (status == RESPONSE_STATUS_ERROR) {
+    report_server_error(payload, payload_len);
+    rc = RESULT_FATAL;
+    goto done;
+  }
+  
+  if (status != RESPONSE_STATUS_SUCCESS) {
+    fprintf(stderr, "Status: 1\nERROR: invalid server response\n");
+    goto done;
+  }
+
+  if (file_type == FILE_TYPE_TEXT) {
+    printf("Status: 0\nText file contents:\n");
+  } else if (payload_len <= MAX_URL_SZ) {
+    printf("Status: 0\nURL (%u bytes): ", payload_len);
+  } else {
+    fprintf(stderr, "Status: 1\nERROR: URL longer than expected\n");
+    goto done;
+  }
+
+  if (payload_len > 0)
+    fwrite(payload, 1, payload_len, stdout);
+  if (payload_len == 0 || payload[payload_len - 1] != '\n')
+    fputc('\n', stdout);
+  rc = RESULT_OK;
+
+done:
+  free(payload);
+  fclose(file);
+  return rc;
+}
+
 static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
   printf("Please enter filename: ");
   fflush(stdout);
@@ -344,21 +355,17 @@ static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
       return -1;
     }
 
-    // If the server responds before a filename is entered—or waiting or reading fails—it reports the issue 
-    // and returns -1. This lets the client notice server-side errors instead of waiting indefinitely for input.
     if (FD_ISSET(sockfd, &readfds)) {
       uint32_t status, payload_len;
       uint8_t *payload = NULL;
       if (receive_response(sockfd, &status, &payload, &payload_len, BUFSIZE) < 0) {
         fprintf(stderr, "Status: 1\nERROR receiving server response while waiting for filename\n");
+      } else if (status == RESPONSE_STATUS_TIMEOUT) {
+        report_server_timeout(payload, payload_len);
+      } else if (status == RESPONSE_STATUS_RATELIMIT) {
+        report_server_ratelimit(payload, payload_len);
       } else if (status == RESPONSE_STATUS_ERROR) {
         report_server_error(payload, payload_len);
-      } else if (status == RESPONSE_STATUS_TIMEOUT){
-        fprintf(stderr, "Status: 2\nTIMEOUT: ");
-        if (payload_len > 0) {
-          fwrite(payload, 1, payload_len, stderr);
-        }
-        fputc('\n', stderr);
       } else {
         fprintf(stderr, "Status: 1\nERROR: unexpected server response while waiting for filename\n");
       }
@@ -368,9 +375,6 @@ static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
 
     if (FD_ISSET(STDIN_FILENO, &readfds)) {
       if (fgets(filename, (int)capacity, stdin) == NULL) {
-        if (feof(stdin)){
-          return 1;
-        }
         fprintf(stderr, "Status: 1\nERROR reading filename\n");
         return -1;
       }
@@ -387,11 +391,8 @@ int main(int argc, char **argv) {
   struct addrinfo *address;
   char service[16];
   char filename[BUFSIZE];
-  //FILE *file = NULL;
   int sockfd = -1;
   int exit_status = 1;
-  //int64_t file_size;
-  //uint32_t file_type;
   uint32_t status, payload_len;
   uint8_t *payload = NULL;
 
@@ -440,30 +441,33 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // read the server’s acceptance response, then ask for a filename using prompt_for_filename.
+  free(payload);
+  payload = NULL;
+
   if (receive_response(sockfd, &status, &payload, &payload_len, BUFSIZE) < 0) {
-    fprintf(stderr, "Status: 1\nERROR receiving connection response\n");
+    fprintf(stderr, "Status: 1\nERROR receiving server connection response\n");
     goto cleanup;
   }
-
-  if (status == RESPONSE_STATUS_ERROR) {
-    exit_status = report_server_error(payload, payload_len);
+  if (status != RESPONSE_STATUS_SUCCESS) {
+    report_server_error(payload, payload_len);
+    goto cleanup;
+  }
+  if (payload_len != 0) {
+    fprintf(stderr, "Status: 1\nERROR: unexpected server connection response\n");
     goto cleanup;
   }
   free(payload);
   payload = NULL;
-  if (status != RESPONSE_STATUS_ACCEPTED || payload_len != 0) {
-    fprintf(stderr, "Status: 1\nERROR: invalid connection response\n");
-    goto cleanup;
-  }
 
   // Opens and checks the file, determines whether it’s text or an image, and sends the file size and type.
-  // Waits for the server’s “ready” response, sends the file, then receives and displays either the text contents or a QR-code payload.
+  // Receives and displays either the text contents or a QR-code payload.
   // On success or failure, frees the response buffer, closes the file and socket, and returns an exit status.
-  setvbuf(stdin, NULL, _IONBF, 0);
-
   for (;;){
     int p = prompt_for_filename(sockfd, filename, sizeof(filename));
+    if (p == RESPONSE_STATUS_TIMEOUT || p == RESPONSE_STATUS_RATELIMIT) {
+      exit_status = 0;
+      break;
+    }
     if (p==1) {
       exit_status = 0;
       break;
@@ -477,13 +481,17 @@ int main(int argc, char **argv) {
     }
 
     int r = send_one_file(sockfd, filename);
-    if (r == RESULT_FATAL) break;
-  }
-
+    if (r == RESPONSE_STATUS_TIMEOUT || r == RESPONSE_STATUS_RATELIMIT) {
+      exit_status = 0;
+      break;
+    }
+    if (r == RESULT_FATAL)
+      break;
+    exit_status = 0;
+}
 cleanup:
   free(payload);
-  if (sockfd >= 0){
+  if (sockfd >= 0)
     close(sockfd);
-  }
   return exit_status;
 }
