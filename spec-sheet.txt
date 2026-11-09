@@ -1,0 +1,14 @@
+idrk what to put here?
+message framing, how the end of a message is detected, and what happens on early disconnect.
+Client Message Information:
+Message Framing:
+A message is provided in the form of a filepath.
+When the users is prompted for a file name, they must insteda put in the filepath to the file they wish to decode.
+This file must be the same directory as echo client
+
+End Of Message:
+A client ends the message by entering a new line(traditionally with the enter key)
+
+Early Disconnect:
+A Client may prematurely end their connection by entering the: Ctrl+C command to shut down the program.
+This action is then logged by the server
