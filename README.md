@@ -48,17 +48,3 @@ This library is written in C.
 In addition, two test QR codes have been included in this directory under "qrs/qr-code.png" and "qrs/qr-code1.png"
 Another test for text files is included in the txts folder, specifically "testing.txt"
 These files can be used by passing their specified filepaths when prompted for filename (including the folder)
-
-# AI Use:
-Some AI has been used in this project.
-The first and most immediate use of AI has been in the form of Google Gemini's automatic summaries at the start of every search on Google.
-In addition, specific AIs have been consulted to help resolve specific issues that have shown up in development.
-One example of this is:
-    - While developing the logging system of Echoserver, implementation was very rudimentary
-    - The logs were being written into a .txt file, and the rate calculation would have an issue where there would be multiple logs as a result of one action(most commonly if an error was found)
-    - The rate calculation would look for the timestamp of the previous {rate_requests}'s value, and if it were less then {rate_seconds} seconds ago, then it would disconnect the clinet, and write two new logs(one for registering the error, and a second for disconnecting the client)
-    - The rate calculation is done whenever a new log is created, thus for each of these new logs, they would print new error logs, causing an infinite loop
-    -Claude was consulted on how to fix this issue. Its implementation for a fix was analyzed and adapted for our uses. Specifically, the logging was changed to a .json based system, and the issue regarding the infinite error logs was changed to a rate_entires array to store the number of request
-Another instance of AI use was:
-    - While implementing multithreading, functions like gethostname would give garbled strings because the different threads would try to pass pointers to the same buffer at the same time and override eachother
-    - Copilot was consulted to address this problem, and its implementation was likewise analyzed and adapted for our uses, particularly its use of mutex to keep track of the multiple threads and prevent them affecting eachother. 
