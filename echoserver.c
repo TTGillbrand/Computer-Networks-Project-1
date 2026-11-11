@@ -63,6 +63,7 @@ struct client_context {
 
 struct rate_entry {
   uint32_t client_ip;
+  uint16_t client_port;
   struct timespec timestamp;
   struct rate_entry *next;
 };
@@ -390,7 +391,7 @@ static int process_args(int argc, char **argv) {
 
 //rate limiting prompt
 
-static int rate_allows_request(uint32_t client_ip) {
+static int rate_allows_request(const struct sockaddr_in *clientaddr) {
   struct timespec now;
 
   // gets the current monotonic time
@@ -422,7 +423,8 @@ static int rate_allows_request(uint32_t client_ip) {
       continue;
     }
 
-    if (current->client_ip == client_ip)
+    if (current->client_ip == clientaddr->sin_addr.s_addr &&
+        current->client_port == clientaddr->sin_port)
       client_requests++;
     entry = &current->next;
   }
@@ -442,7 +444,8 @@ static int rate_allows_request(uint32_t client_ip) {
       fprintf(stderr, "ERROR unlocking rate-limit state: %s\n", strerror(lock_result));
     return -1;
   }
-  request->client_ip = client_ip;
+  request->client_ip = clientaddr->sin_addr.s_addr;
+  request->client_port = clientaddr->sin_port;
   request->timestamp = now;
   request->next = rate_entries;
   rate_entries = request;
@@ -483,7 +486,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
   ftype = ntohl(ftype);
 
   // Checks the client's request rate and rejects requests that exceed the limit.
-  int rate_result = rate_allows_request(clientaddr.sin_addr.s_addr);
+  int rate_result = rate_allows_request(&clientaddr);
   if (rate_result == 0) {
     char message[160];
     snprintf(message, sizeof(message),
