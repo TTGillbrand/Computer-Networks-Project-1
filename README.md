@@ -48,3 +48,58 @@ This library is written in C.
 In addition, two test QR codes have been included in this directory under "qrs/qr-code.png" and "qrs/qr-code1.png"
 Another test for text files is included in the txts folder, specifically "testing.txt"
 These files can be used by passing their specified filepaths when prompted for filename (including the folder)
+
+# Fault Table
+Fault | Expected behavior | Observed behavior (with evidence) | Fix 
+Client killed mid-transfer | Client is disconnected, and server persists | Client is disconnected, this is logged, and the server persists
+Connection Reset mid-transfer | Client is disconnected, and then reconnects as per a new connection | as expected
+Partial send | the same url as per regular QR code | the url is the same
+Packet loss | upload succeeds, but takes a much greater amount of time | successfully interpreted url
+
+
+# Test Cases
+Assume all of the following examples of tests use the default server arguments.
+The format of each test case is name of the test case, which is a small description of what it hopes to demonstrate, followed by the output from the terminal
+Image Test 1:
+./echoclient localhost 2012
+Please enter filename: qrs/qr-code.png
+Status: 0
+URL (28 bytes): https://youtu.be/dQw4w9WgXcQ
+Image Test 2:
+./echoclient localhost 2012
+Please enter filename: qrs/qr-code1.png
+Status: 0
+URL (23 bytes): https://canvas.wpi.edu/
+Non-image:
+./echoclient localhost 2012
+Please enter filename: E.png
+Status: 1
+ERROR: server could not process the file
+Text File:
+./echoclient localhost 2012
+Please enter filename: spec-sheet.txt
+Status: 0
+Text file contents:
+message framing, how the end of a message is detected, and what happens on early disconnect.
+Client Message Information:
+Message Framing:
+A message is provided in the form of a filepath.
+When the users is prompted for a file name, they must insteda put in the filepath to the file they wish to decode.
+    
+This file must be the same directory as echoclient
+
+End Of Message:
+A client ends the message by entering a new line (traditionally with the enter key)
+
+Early Disconnect:
+A Client may prematurely end their connection by entering the Ctrl+C command to shut down the program.
+This action is then logged by the server
+Hostile Payload:
+./echoclient localhost 2012
+Please enter filename: qrs/hostile.png
+Status: 1
+ERROR: server could not process the file
+
+## QR Code Decoding Library Justification
+The quirc library was chosen for decoding. This was chosen quirc is written primarily in C, and thus the majority of the program is written in the same language.
+In addition, the actual decoiding process was well described in the documentation of the library, but it was simple and easy to implement

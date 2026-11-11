@@ -1,24 +1,22 @@
-2026-11-09 01:26:43 0.0.0.0 {"event":"server_start","detail":"port=2222 rate=8/60s max_users=8 timeout=100s"}
-2026-11-09 01:26:47 127.0.0.1 {"event":"connect","detail":"client port 59280"}
-2026-11-09 01:26:54 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:26:54 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:13 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:13 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:16 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:16 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:20 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:21 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:26 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:26 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:34 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:34 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:37 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:37 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:40 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
-2026-11-09 01:27:40 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
-2026-11-09 01:27:44 127.0.0.1 {"event":"rate_limited","detail":"8 requests per 60 s exceeded (fsize=7618)"}
-2026-11-09 01:27:44 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
-2026-11-09 01:41:28 127.0.0.1 {"event":"connect","detail":"client port 55228"}
-2026-11-09 01:41:31 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
-2026-11-09 01:42:56 127.0.0.1 {"event":"connect","detail":"client port 38826"}
-2026-11-09 01:43:06 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
+2026-11-10 22:04:25 0.0.0.0 {"event":"server_start","detail":"port=2012 rate=3/60s max_users=3 timeout=80s"}
+2026-11-10 22:04:27 127.0.0.1 {"event":"connect","detail":"client port 48530"}
+2026-11-10 22:04:31 127.0.0.1 {"event":"file_received","detail":"7618 bytes type=image"}
+2026-11-10 22:04:31 127.0.0.1 {"event":"qr_ok","detail":"decoded 28 bytes: https://youtu.be/dQw4w9WgXcQ"}
+2026-11-10 22:04:46 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
+2026-11-10 22:04:47 127.0.0.1 {"event":"connect","detail":"client port 37328"}
+2026-11-10 22:04:51 127.0.0.1 {"event":"file_received","detail":"7216 bytes type=image"}
+2026-11-10 22:04:51 127.0.0.1 {"event":"qr_ok","detail":"decoded 23 bytes: https://canvas.wpi.edu/"}
+2026-11-10 22:05:00 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
+2026-11-10 22:05:01 127.0.0.1 {"event":"connect","detail":"client port 40334"}
+2026-11-10 22:05:05 127.0.0.1 {"event":"file_received","detail":"493 bytes type=image"}
+2026-11-10 22:05:05 127.0.0.1 {"event":"qr_not_found","detail":"no QR code found in 256x256 image"}
+2026-11-10 22:05:05 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
+2026-11-10 22:05:38 127.0.0.1 {"event":"connect","detail":"client port 36664"}
+2026-11-10 22:05:49 127.0.0.1 {"event":"file_received","detail":"670 bytes type=text"}
+2026-11-10 22:05:49 127.0.0.1 {"event":"text_ok","detail":"echoed 670 bytes"}
+2026-11-10 22:07:12 127.0.0.1 {"event":"timeout","detail":"no data for 80 s while reading file size"}
+2026-11-10 22:07:12 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
+2026-11-10 22:08:10 127.0.0.1 {"event":"connect","detail":"client port 39896"}
+2026-11-10 22:08:14 127.0.0.1 {"event":"file_received","detail":"2008 bytes type=image"}
+2026-11-10 22:08:14 127.0.0.1 {"event":"image_rejected","detail":"unknown image type"}
+2026-11-10 22:08:14 127.0.0.1 {"event":"disconnect","detail":"closing connection"}
