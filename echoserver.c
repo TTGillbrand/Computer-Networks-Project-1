@@ -79,7 +79,6 @@ static struct rate_entry *rate_entries = NULL;
 
 // stb_image keeps its failure reason in shared global state.
 static pthread_mutex_t stbi_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t rate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t users_cv = PTHREAD_COND_INITIALIZER;
@@ -412,11 +411,12 @@ static int rate_allows_request(const struct sockaddr_in *clientaddr) {
 
   struct rate_entry **entry = &rate_entries;
   int client_requests = 0;
+  time_t rate_window = (time_t)rate_seconds;
   while (*entry != NULL) {
     struct rate_entry *current = *entry;
     time_t elapsed = now.tv_sec - current->timestamp.tv_sec;
-    int expired = elapsed > rate_seconds ||
-                  (elapsed == rate_seconds && now.tv_nsec >= current->timestamp.tv_nsec);
+    int expired = elapsed > rate_window ||
+                  (elapsed == rate_window && now.tv_nsec >= current->timestamp.tv_nsec);
     if (expired) {
       *entry = current->next;
       free(current);
@@ -532,7 +532,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
             ftype == FILE_TYPE_TEXT ? "text" : "image");
 
   /*
-    If the file is text, validates it as UTF-8, prints it, and sends the text back (code 0).
+    If the file is text, validates it as UTF-8 and sends the text back (code 0).
     If it's an image, decodes it and searches for a QR code. It sends back the QR payload if found,
     or code 1 otherwise.
   */
@@ -541,21 +541,6 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
       free(buffer);
       log_event(ip, "invalid_text", "received text file is not valid UTF-8 text");
       return send_failure(connfd) == 0;
-    }
-
-    int mutex_result = pthread_mutex_lock(&stdout_mutex);
-    if (mutex_result != 0) {
-      fprintf(stderr, "ERROR locking stdout mutex: %s\n", strerror(mutex_result));
-    } else {
-      printf("Received text file contents (%u bytes):\n", fsize);
-      if (fwrite(buffer, 1, fsize, stdout) != fsize)
-        perror("ERROR printing received text file");
-      if (buffer[fsize - 1] != '\n')
-        putchar('\n');
-      fflush(stdout);
-      mutex_result = pthread_mutex_unlock(&stdout_mutex);
-      if (mutex_result != 0)
-        fprintf(stderr, "ERROR unlocking stdout mutex: %s\n", strerror(mutex_result));
     }
 
     int response_result = send_response(connfd, RESPONSE_STATUS_SUCCESS, buffer, fsize);
