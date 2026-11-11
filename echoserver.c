@@ -36,6 +36,7 @@
 
 #define QSIZE 5
 
+#define FILE_TYPE_NEITHER 0
 #define FILE_TYPE_IMAGE 1
 #define FILE_TYPE_TEXT 2
 
@@ -52,7 +53,7 @@
 #define DEFAULT_TIMEOUT_SECONDS 80
 
 // max values to protect server
-#define MAX_FILE_SZ (20U * 1024U * 1024U)   // max for qr file, in bytes
+#define MAX_FILE_SZ UINT32_MAX   // file size is encoded as a 32-bit unsigned integer
 #define MAX_PIXELS  (25ULL * 1000 * 1000)   // max decoded image size
 #define MAX_URL_SZ  200                     // in characters
 
@@ -79,6 +80,7 @@ static struct rate_entry *rate_entries = NULL;
 
 // stb_image keeps its failure reason in shared global state.
 static pthread_mutex_t stbi_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t stdout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t rate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t users_cv = PTHREAD_COND_INITIALIZER;
@@ -87,12 +89,14 @@ static FILE *logfp = NULL;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile sig_atomic_t stop_requested = 0;
+
+// marks that the server should stop accepting new connections.
 static void on_signal(int sig) {
   (void)sig;
   stop_requested = 1;
 }
 
-//helper function to reinterpret stuff into json style type shit
+// escapes quotes, backslashes, and control bytes for log-detail JSON strings.
 static void json_escape(const char *in, char *out, size_t cap) {
   size_t o = 0;
   for (; *in && o + 7 < cap; in++) {
@@ -136,8 +140,7 @@ static void log_event(const char *ip, const char *event, const char *fmt, ...) {
   errno = saved;
 }
 
-//helper functions for ocket
-
+//helper functions for socket
 static int send_all(int fd, const void *buffer, size_t length) {
   size_t sent = 0;
   while (sent < length) {
@@ -212,7 +215,7 @@ static void drain_pending(int fd, const char *ip) {
               (unsigned long long)total);
 }
 
-//function to return the status back to the client
+// sends a response status, payload length, and optional payload to the client.
 static int send_response(int fd, uint32_t status, const uint8_t *payload, uint32_t payload_len) {
   uint32_t net_status = htonl(status);
   uint32_t net_payload_len = htonl(payload_len);
@@ -225,24 +228,78 @@ static int send_response(int fd, uint32_t status, const uint8_t *payload, uint32
   return 0;
 }
 
-// helper function to take message and interpret it as a response format
+// prints a file response status and output to the server console.
+static void print_file_response(uint32_t status, uint32_t file_type,
+                                const uint8_t *payload, uint32_t payload_len) {
+  int lock_result = pthread_mutex_lock(&stdout_mutex);
+  if (lock_result != 0) {
+    fprintf(stderr, "ERROR locking stdout mutex: %s\n", strerror(lock_result));
+    return;
+  }
+
+  printf("Status: %u\n", status);
+  if (status == RESPONSE_STATUS_SUCCESS) {
+    if (file_type == FILE_TYPE_TEXT) {
+      printf("Text file contents:\n");
+    } else {
+      printf("URL (%u bytes): ", payload_len);
+    }
+    if (payload_len > 0)
+      fwrite(payload, 1, payload_len, stdout);
+    if (payload_len == 0 || payload[payload_len - 1] != '\n')
+      fputc('\n', stdout);
+  } else if (status == RESPONSE_STATUS_ERROR) {
+    fputs("ERROR: ", stdout);
+    if (payload_len > 0)
+      fwrite(payload, 1, payload_len, stdout);
+    else
+      fputs("server could not process the file", stdout);
+    fputc('\n', stdout);
+  } else if (status == RESPONSE_STATUS_TIMEOUT ||
+             status == RESPONSE_STATUS_RATELIMIT) {
+    if (payload_len > 0)
+      fwrite(payload, 1, payload_len, stdout);
+    else if (status == RESPONSE_STATUS_TIMEOUT)
+      fputs("Connection timed out.", stdout);
+    else
+      fputs("Rate limit exceeded.", stdout);
+    if (payload_len == 0 || payload[payload_len - 1] != '\n')
+      fputc('\n', stdout);
+  }
+  fflush(stdout);
+
+  lock_result = pthread_mutex_unlock(&stdout_mutex);
+  if (lock_result != 0)
+    fprintf(stderr, "ERROR unlocking stdout mutex: %s\n", strerror(lock_result));
+}
+
+// sends a file response and prints the same response on the server console (small-seg test).
+static int send_file_response(int fd, uint32_t status, uint32_t file_type,
+                              const uint8_t *payload, uint32_t payload_len) {
+  int result = send_response(fd, status, payload, payload_len);
+  if (result == 0)
+    print_file_response(status, file_type, payload, payload_len);
+  return result;
+}
+
+// sends a string message using the standard response framing.
 static int send_message(int fd, uint32_t status, const char *msg) {
   return send_response(fd, status, (const uint8_t *)msg, (uint32_t)strlen(msg));
 }
 
-// helper function to turn a failure state into a response form
-static int send_failure(int fd) {
-  return send_response(fd, RESPONSE_STATUS_ERROR, NULL, 0);
-}
-
-// Handles a failed recv_all/discard_bytes: logs, and on timeout tells the client (code 2).
+// handles a failed recv_all/discard_bytes: logs, and on timeout tells the client.
 static void fail_recv(int fd, const char *ip, int result, const char *what) {
   if (result == 1) {
     log_event(ip, "client_eof", "client closed while reading %s", what);
   } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
     log_event(ip, "timeout", "no data for %d s while reading %s", timeout_seconds, what);
-    if (send_message(fd, RESPONSE_STATUS_TIMEOUT, "\nConnection timed out.") < 0)
+    if (send_message(fd, RESPONSE_STATUS_TIMEOUT, "\nConnection timed out.") < 0) {
       log_event(ip, "send_failed", "could not send timeout message: %m");
+    } else {
+      static const uint8_t message[] = "Connection timed out.";
+      print_file_response(RESPONSE_STATUS_TIMEOUT, FILE_TYPE_NEITHER,
+                          message, (uint32_t)(sizeof(message) - 1));
+    }
   } else if (errno == ECONNRESET) {
     log_event(ip, "client_reset", "connection reset or truncated while reading %s", what);
   } else {
@@ -250,7 +307,7 @@ static void fail_recv(int fd, const char *ip, int result, const char *what) {
   }
 }
 
-// After a rejection reply, the client's file bytes are still in the socket. Consume them
+// after a rejection reply, the client's file bytes are still in the socket. Consume them
 // so the next 8 bytes we read really are the next request's header.
 // Returns 1 to keep the session, 0 to close it.
 static int skip_body(int fd, const char *ip, uint32_t fsize) {
@@ -264,8 +321,11 @@ static int skip_body(int fd, const char *ip, uint32_t fsize) {
 }
 
 // Sends a rejection (msg == NULL means code 1 with no payload), then skips the body.
-static int reject_and_skip(int fd, const char *ip, uint32_t status, const char *msg, uint32_t fsize) {
-  int rc = msg ? send_message(fd, status, msg) : send_response(fd, status, NULL, 0);
+static int reject_and_skip(int fd, const char *ip, uint32_t status, const char *msg,
+                           uint32_t fsize, uint32_t file_type) {
+  const uint8_t *payload = (const uint8_t *)msg;
+  uint32_t payload_len = msg ? (uint32_t)strlen(msg) : 0;
+  int rc = send_file_response(fd, status, file_type, payload, payload_len);
   if (rc < 0) {
     log_event(ip, "send_failed", "could not send rejection: %m");
     return 0;
@@ -336,11 +396,12 @@ static int parse_positive_int(const char *text, int *value) {
   return 0;
 }
 
-//ret\urns true if either of the given strings are equal
+// returns whether arg matches either of the two supplied names.
 static int opt_is(const char *arg, const char *a, const char *b) {
   return strcmp(arg, a) == 0 || strcmp(arg, b) == 0;
 }
 
+// parses and validates the server's command-line options.
 static int process_args(int argc, char **argv) {
   int seen_port = 0, seen_rate = 0, seen_users = 0, seen_timeout = 0;
   int i = 1;
@@ -388,8 +449,7 @@ static int process_args(int argc, char **argv) {
   return 0;
 }
 
-//rate limiting prompt
-
+// tracks and enforces the request limit independently for each client.
 static int rate_allows_request(const struct sockaddr_in *clientaddr) {
   struct timespec now;
 
@@ -411,12 +471,11 @@ static int rate_allows_request(const struct sockaddr_in *clientaddr) {
 
   struct rate_entry **entry = &rate_entries;
   int client_requests = 0;
-  time_t rate_window = (time_t)rate_seconds;
   while (*entry != NULL) {
     struct rate_entry *current = *entry;
     time_t elapsed = now.tv_sec - current->timestamp.tv_sec;
-    int expired = elapsed > rate_window ||
-                  (elapsed == rate_window && now.tv_nsec >= current->timestamp.tv_nsec);
+    int expired = elapsed > rate_seconds ||
+                  (elapsed == rate_seconds && now.tv_nsec >= current->timestamp.tv_nsec);
     if (expired) {
       *entry = current->next;
       free(current);
@@ -494,28 +553,28 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
              rate_requests, rate_seconds);
     log_event(ip, "rate_limited", "%d requests per %d s exceeded (fsize=%u)",
               rate_requests, rate_seconds, fsize);
-    return reject_and_skip(connfd, ip, RESPONSE_STATUS_RATELIMIT, message, fsize);
+    return reject_and_skip(connfd, ip, RESPONSE_STATUS_RATELIMIT, message, fsize, ftype);
   }
   if (rate_result < 0) {
     log_event(ip, "rate_error", "could not enforce the rate limit");
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
   // Rejects oversized files, empty files, and unsupported file types (session stays open).
-  if (fsize > MAX_FILE_SZ) {
-    log_event(ip, "file_too_large", "%u bytes (max %u)", fsize, MAX_FILE_SZ);
-    return reject_and_skip(connfd, ip, RESPONSE_STATUS_ERROR, NULL, fsize);
+  if (fsize > UINT32_MAX) {
+    log_event(ip, "file_too_large", "%u bytes (max %u)", fsize, UINT32_MAX);
+    return reject_and_skip(connfd, ip, RESPONSE_STATUS_ERROR, NULL, fsize, ftype);
   }
   if (fsize == 0 || (ftype != FILE_TYPE_IMAGE && ftype != FILE_TYPE_TEXT)) {
     log_event(ip, "bad_type", "fsize=%u ftype=%u", fsize, ftype);
-    return reject_and_skip(connfd, ip, RESPONSE_STATUS_ERROR, NULL, fsize);
+    return reject_and_skip(connfd, ip, RESPONSE_STATUS_ERROR, NULL, fsize, ftype);
   }
 
   uint8_t *buffer = malloc((size_t)fsize);
   if (buffer == NULL) {
     log_event(ip, "alloc_failed", "could not allocate %u bytes for upload", fsize);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;                          // body not consumed, so close
   }
 
@@ -532,7 +591,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
             ftype == FILE_TYPE_TEXT ? "text" : "image");
 
   /*
-    If the file is text, validates it as UTF-8 and sends the text back (code 0).
+    If the file is text, validates it as UTF-8, prints it, and sends the text back (code 0).
     If it's an image, decodes it and searches for a QR code. It sends back the QR payload if found,
     or code 1 otherwise.
   */
@@ -540,10 +599,10 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
     if (!is_valid_text(buffer, fsize)) {
       free(buffer);
       log_event(ip, "invalid_text", "received text file is not valid UTF-8 text");
-      return send_failure(connfd) == 0;
+      return send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0) == 0;
     }
 
-    int response_result = send_response(connfd, RESPONSE_STATUS_SUCCESS, buffer, fsize);
+    int response_result = send_file_response(connfd, RESPONSE_STATUS_SUCCESS, ftype, buffer, fsize);
     free(buffer);
     if (response_result < 0) {
       log_event(ip, "send_failed", "could not send text response: %m");
@@ -559,7 +618,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
   if (mutex_result != 0) {
     log_event(ip, "internal_error", "locking image decoder mutex: %s", strerror(mutex_result));
     free(buffer);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
@@ -584,20 +643,20 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
     log_event(ip, "internal_error", "unlocking image decoder mutex: %s", strerror(mutex_result));
     if (pixels)
       stbi_image_free(pixels);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
   if (!pixels) {
     log_event(ip, "image_rejected", "%s", reason_copy);
-    return send_failure(connfd) == 0;
+    return send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0) == 0;
   }
 
   struct quirc *qr = quirc_new();
   if (!qr) {
     log_event(ip, "alloc_failed", "quirc_new failed");
     stbi_image_free(pixels);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
@@ -606,7 +665,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
     log_event(ip, "alloc_failed", "quirc_resize failed for %dx%d", w, h);
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
@@ -616,7 +675,7 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
     log_event(ip, "internal_error", "quirc_begin returned no image buffer");
     quirc_destroy(qr);
     stbi_image_free(pixels);
-    send_failure(connfd);
+    send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
     return 0;
   }
 
@@ -655,9 +714,9 @@ static int process_client_request(int connfd, const char *ip, struct sockaddr_in
 
   int response_result;
   if (have_url)
-    response_result = send_response(connfd, RESPONSE_STATUS_SUCCESS, url, url_len);
+    response_result = send_file_response(connfd, RESPONSE_STATUS_SUCCESS, ftype, url, url_len);
   else
-    response_result = send_failure(connfd);   // no usable payload: code 1, no message
+    response_result = send_file_response(connfd, RESPONSE_STATUS_ERROR, ftype, NULL, 0);
   quirc_destroy(qr);
 
   if (response_result < 0) {
@@ -725,13 +784,14 @@ static void *client_thread(void *arg) {
     while (process_client_request(connfd, ip, clientaddr)) {}
   }
 
-  log_event(ip, "disconnect", "closing connection");
+  log_event(ip, "disconnect", "client port %u; closing connection",
+            (unsigned)ntohs(clientaddr.sin_port));
   close(connfd);
   release_user_slot();
   return NULL;
 }
 
-// Logs, releases what has been set up so far, and exits. listenfd < 0 means "not open yet".
+// logs a fatal startup error, releases initialized resources, and exits. 
 static void fatal(const char *msg, int listenfd, pthread_attr_t *attr) {
   log_event("0.0.0.0", "fatal", "%s: %m", msg);
   perror(msg);
@@ -744,6 +804,7 @@ static void fatal(const char *msg, int listenfd, pthread_attr_t *attr) {
   exit(1);
 }
 
+// configures the server, accepts client connections, and shuts down cleanly.
 int main(int argc, char **argv) {
   int listenfd = -1;                   // listening socket
   int connfd;                          // connection socket

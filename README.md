@@ -81,6 +81,7 @@ Please enter filename: spec-sheet.txt
 Status: 0
 Text file contents:
 message framing, how the end of a message is detected, and what happens on early disconnect.
+
 Client Message Information:
 Message Framing:
 A message is provided in the form of a filepath.
@@ -100,6 +101,18 @@ Please enter filename: qrs/hostile.png
 Status: 1
 ERROR: server could not process the file
 
-## QR Code Decoding Library Justification
+# QR Code Decoding Library Justification
 The quirc library was chosen for decoding. This was chosen quirc is written primarily in C, and thus the majority of the program is written in the same language.
-In addition, the actual decoiding process was well described in the documentation of the library, but it was simple and easy to implement
+In addition, the actual decoding process was well described in the documentation of the library, but it was simple and easy to implement
+
+# Roadmap 4 Questions
+Which call would block a single-threaded server, and on what?
+    The main blocking call for client data is recv() inside recv_all: it waits for the connected client to send the requested bytes. The server sets a receive timeout, so it won’t wait indefinitely.
+
+How does your design serve clients at the same time?
+    The server uses a thread-per-client design. 
+    The main thread waits for connections with accept() and starts a detached worker thread for each accepted client using pthread_create(). Each worker handles that client’s requests independently (client_thread), so one client waiting on network input doesn’t block the others.
+
+What happens when your client limit is reached?
+    The server caps concurrent clients at max_users; connections beyond the limit are rejected.
+    Specifically, the server accepts the new connection but doesn’t create a worker thread for it. Instead, it sends a “Server is busy. Please try again later.” error and closes the connection.

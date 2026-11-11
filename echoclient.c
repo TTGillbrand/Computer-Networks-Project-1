@@ -19,7 +19,7 @@
 #define BUFSIZE 1024
 
 // max values to protect server
-#define MAX_FILE_SZ (20U * 1024U * 1024U)
+#define MAX_FILE_SZ UINT32_MAX
 #define MAX_URL_SZ 200
 
 #define FILE_TYPE_NEITHER 0
@@ -62,6 +62,7 @@ static int process_args(int argc, char **argv, struct client_config *cfg) {
   return 0;
 }
 
+// sends all requested bytes to the server.
 static int send_all(int fd, const void *buffer, size_t length) {
   size_t sent = 0;
   while (sent < length) {
@@ -78,6 +79,7 @@ static int send_all(int fd, const void *buffer, size_t length) {
   return 0;
 }
 
+// receives the requested number of bytes from the server.
 static int recv_all(int fd, void *buffer, size_t length) {
   size_t received = 0;
   while (received < length) {
@@ -94,6 +96,7 @@ static int recv_all(int fd, void *buffer, size_t length) {
   return 1;
 }
 
+// detects whether a file is a supported image or valid UTF-8 text file.
 static int get_file_type(FILE *file) {
   unsigned char header[12];
   if (fseek(file, 0, SEEK_SET) != 0)
@@ -173,6 +176,7 @@ static int get_file_type(FILE *file) {
   return !ferror(file) && remaining_utf8 == 0 ? FILE_TYPE_TEXT : FILE_TYPE_NEITHER;
 }
 
+// streams a file's contents to the server from its beginning.
 static int send_file(int sockfd, FILE *file) {
   unsigned char buffer[BUFSIZE];
   size_t bytes_read;
@@ -186,6 +190,7 @@ static int send_file(int sockfd, FILE *file) {
   return ferror(file) ? -1 : 0;
 }
 
+// receives and validates a framed server response and its optional payload.
 static int receive_response(int sockfd, uint32_t *status, uint8_t **payload, uint32_t *payload_len, uint32_t max_payload) {
   uint32_t net_status, net_payload_len;
   int result = recv_all(sockfd, &net_status, sizeof(net_status));
@@ -215,6 +220,7 @@ static int receive_response(int sockfd, uint32_t *status, uint8_t **payload, uin
   return 0;
 }
 
+// prints a server-side file-processing error and closes connection.
 static int report_server_error(const uint8_t *message, uint32_t length) {
   fprintf(stderr, "Status: 1\nERROR: ");
   if (length > 0)
@@ -225,6 +231,7 @@ static int report_server_error(const uint8_t *message, uint32_t length) {
   return 1;
 }
 
+// prints the server's timeout status and explanatory message.
 static void report_server_timeout(const uint8_t *message, uint32_t length) {
   fprintf(stderr, "Status: 2\n");
   if (length > 0) {
@@ -240,6 +247,7 @@ static void report_server_timeout(const uint8_t *message, uint32_t length) {
     fputc('\n', stderr);
 }
 
+// prints the server's rate-limit status and explanatory message.
 static void report_server_ratelimit(const uint8_t *message, uint32_t length) {
   fprintf(stderr, "Status: 3\n");
   if (length > 0)
@@ -250,6 +258,7 @@ static void report_server_ratelimit(const uint8_t *message, uint32_t length) {
     fputc('\n', stderr);
 }
 
+// uploads one file, displays the server response, and returns the connection result.
 static int send_one_file(int sockfd, const char *filename) {
   FILE *file = fopen(filename, "rb");
   uint8_t *payload = NULL;
@@ -267,8 +276,8 @@ static int send_one_file(int sockfd, const char *filename) {
     rc = RESULT_RETRY;
     goto done;
   }
-  if ((uint64_t)file_size > MAX_FILE_SZ) {
-    fprintf(stderr, "Status: 1\nERROR: file too large (maximum %u bytes)\n", MAX_FILE_SZ);
+  if ((uint64_t)file_size > UINT32_MAX) {
+    fprintf(stderr, "Status: 1\nERROR: file too large (maximum %u bytes)\n", UINT32_MAX);
     rc = RESULT_RETRY;
     goto done;
   }
@@ -287,7 +296,7 @@ static int send_one_file(int sockfd, const char *filename) {
     perror("Status: 1\nERROR sending file data");
     goto done;
   }
-  if (receive_response(sockfd, &status, &payload, &payload_len, MAX_FILE_SZ) < 0) {
+  if (receive_response(sockfd, &status, &payload, &payload_len, UINT32_MAX) < 0) {
     fprintf(stderr, "Status: 1\nERROR receiving server response\n");
     goto done;
   }
@@ -335,6 +344,7 @@ done:
   return rc;
 }
 
+// prompts for a filename while also listening for asynchronous server responses.
 static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
   printf("Please enter filename: ");
   fflush(stdout);
@@ -384,6 +394,7 @@ static int prompt_for_filename(int sockfd, char *filename, size_t capacity) {
   }
 }
 
+// connects to the server and repeatedly prompts for files to upload.
 int main(int argc, char **argv) {
   struct client_config config;
   struct addrinfo hints;
